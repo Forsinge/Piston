@@ -1,10 +1,11 @@
-use piston::{index, indexu8};
-use crate::context::{MAX_MOVE_COUNT, SearchContext};
-use crate::bitboard::{BITS, RANKS, shift_left, shift_right};
-use crate::{Display, get_attack_bitboard};
-use crate::movegen::{get_evasion_mask, get_pinned_bitboard, pseudo_bishop, pseudo_king, pseudo_knight, pseudo_left_capture, pseudo_push, pseudo_queen, pseudo_right_capture, pseudo_rook};
-use crate::output::string_to_index;
+use std::num::NonZeroU64;
+use piston::{index};
+use crate::state::{MAX_MOVE_COUNT, EngineState};
+use crate::bitboard::{ANTIDIAGS, BITS, DIAGONALS, FILES, LUT_BISHOP, LUT_KING, LUT_KNIGHT, LUT_PAWN_CAPTURES, LUT_ROOK, RANKS, RAYS};
+use crate::movegen::*;
+use crate::output::{string_to_index, Display};
 
+pub const STARTPOS_FEN: &str = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1 ";
 
 pub const WHITE_SHORT_CASTLE: u8 = 1;
 pub const WHITE_LONG_CASTLE: u8 = 2;
@@ -14,12 +15,18 @@ pub const BLACK_LONG_CASTLE: u8 = 8;
 pub const WHITE_CASTLES: u8 = 3;
 pub const BLACK_CASTLES: u8 = 12;
 
+pub const WHITE_SHORT_CASTLE_BITS: u64 = 0x0900000000000000;
+pub const WHITE_LONG_CASTLE_BITS: u64 = 0x8800000000000000;
+pub const BLACK_SHORT_CASTLE_BITS: u64 = 0x09;
+pub const BLACK_LONG_CASTLE_BITS: u64 = 0x88;
+
+
 pub const FILE_CHARS: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 
 #[derive(Default, Copy, Clone)]
 pub struct Move {
-    pub origin: u8,
-    pub target: u8,
+    pub origin: u64,
+    pub target: u64,
     pub tier: u8,
     pub code: u8,
 }
@@ -38,10 +45,9 @@ impl Move {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub struct PositionState {
     pub en_passant: u64,
-    pub forward: i8,
     pub castle_flags: u8,
     pub move_ptr: usize,
     pub move_cnt: usize,
@@ -53,7 +59,6 @@ impl PositionState {
     pub fn next(&self) -> PositionState {
         PositionState {
             en_passant: 0,
-            forward: -self.forward,
             castle_flags: self.castle_flags,
             move_ptr: self.move_ptr + MAX_MOVE_COUNT,
             move_cnt: 0,
@@ -63,9 +68,14 @@ impl PositionState {
     }
 }
 
-#[derive(Default)]
+#[derive(Default, Copy, Clone)]
 pub struct Position {
-    pub sets: [u64; 6],
+    pub pawns: u64,
+    pub knights: u64,
+    pub bishops: u64,
+    pub rooks: u64,
+    pub queens: u64,
+    pub kings: u64,
     pub all: u64,
     pub player: u64,
     pub enemy: u64,
@@ -90,7 +100,16 @@ impl Position {
                 let bit = pointer.swap_bytes();
                 let tier = pieces.find(c).unwrap() % 6;
 
-                pos.sets[tier] |= bit;
+                match tier {
+                    0 => pos.pawns |= bit,
+                    1 => pos.knights |= bit,
+                    2 => pos.bishops |= bit,
+                    3 => pos.rooks |= bit,
+                    4 => pos.queens |= bit,
+                    5 => pos.kings |= bit,
+                    _ => {},
+                }
+
                 pos.all |= bit;
 
                 if c.is_uppercase() {
@@ -108,13 +127,11 @@ impl Position {
         if fen_split[1] == "w" {
             pos.state.turn = true;
             pos.enemy = pos.player ^ pos.all;
-            pos.state.forward = 8;
         }
 
         else {
             pos.enemy = pos.player;
             pos.player ^= pos.all;
-            pos.state.forward = -8;
         }
 
         for c in fen_split[2].chars() {
@@ -128,15 +145,21 @@ impl Position {
         }
 
         if fen_split[3] != "-" {
-            pos.state.en_passant = BITS[string_to_index(fen_split[3])];
+            let offset = if pos.state.turn { -8 } else { 8 };
+            pos.state.en_passant = BITS[(string_to_index(fen_split[3]) as i8 - offset) as usize];
         }
 
         pos
     }
 
-    pub fn next(&self) -> Position {
+    pub fn next(&self, cleared_bits: u64) -> Position {
         Position {
-            sets: self.sets.clone(),
+            pawns: self.pawns & cleared_bits,
+            knights: self.knights & cleared_bits,
+            bishops: self.bishops & cleared_bits,
+            rooks: self.rooks & cleared_bits,
+            queens: self.queens & cleared_bits,
+            kings: self.kings & cleared_bits,
             all: self.all,
             player: self.player,
             enemy: self.enemy,
@@ -144,145 +167,528 @@ impl Position {
         }
     }
 
-    pub fn push_move(&mut self, sc: &mut SearchContext, origin: u8, target: u8, tier: u8, code: u8) {
-        sc.move_table[self.state.move_ptr + self.state.move_cnt] = Move { origin, target, tier, code };
+    pub fn push_move_with_code(&mut self, es: &mut EngineState, origin: u64, target: u64, tier: u8, code: u8) {
+        es.move_table[self.state.move_ptr + self.state.move_cnt] = Move { origin, target, tier, code };
         self.state.move_cnt += 1;
     }
 
-    pub fn generate(&mut self, sc: &mut SearchContext) {
-        let enemy_attacks = get_attack_bitboard(&self, false);
-        let pinned = get_pinned_bitboard(&self);
-        let mut evasion_mask = !0u64;
+    pub fn push_move(&mut self, es: &mut EngineState, origin: u64, target: u64, tier: u8) {
+        es.move_table[self.state.move_ptr + self.state.move_cnt] = Move { origin, target, tier, code: 0};
+        self.state.move_cnt += 1;
+    }
+
+    pub fn square_tier(&self, square: u64) -> usize {
+        if square & self.pawns != 0 { return 0 }
+        if square & self.knights != 0 { return 1 }
+        if square & self.bishops != 0 { return 2 }
+        if square & self.rooks != 0 { return 3 }
+        if square & self.queens != 0 { return 4 }
+        if square & self.kings != 0 { return 5 }
+        6
+    }
+
+    pub fn is_attacked(&self, square: u64, index: usize) -> bool {
+        if LUT_KNIGHT[index] & self.knights & self.enemy != 0 {
+            return true;
+        }
+
+        if LUT_KING[index] & self.kings & self.enemy != 0 {
+            return true;
+        }
+
+        if LUT_PAWN_CAPTURES[!self.state.turn as usize][index] & self.pawns & self.enemy != 0 {
+            return true;
+        }
+
+        if pseudo_rook(square, self.all, index) & (self.rooks | self.queens) & self.enemy != 0 {
+            return true;
+        }
+
+        if pseudo_bishop(square, self.all, index) & (self.bishops | self.queens) & self.enemy != 0 {
+            return true;
+        }
+
+        false
+    }
+
+    pub fn get_attack_bitboard(&self, player: u64, shift_offset: u8) -> u64 {
+        let mut bb = 0;
+
+        let all = self.all & !(self.kings & (self.all ^ player));
+
+        let pawns = player & self.pawns;
+        let mut knights = player & self.knights;
+        let mut bishops = player & (self.bishops | self.queens);
+        let mut rooks = player & (self.rooks | self.queens);
+
+        bb |= pseudo_left_capture(pawns, shift_offset);
+        bb |= pseudo_right_capture(pawns, shift_offset);
+        bb |= pseudo_king(index!(NonZeroU64::new(player & self.kings).unwrap()));
+
+        while knights != 0 {
+            let index = 63 - NonZeroU64::new(knights).unwrap().trailing_zeros() as usize;
+            bb |= pseudo_knight(index);
+            knights &= knights - 1;
+        }
+
+        while bishops != 0 {
+            let index = 63 - NonZeroU64::new(bishops).unwrap().trailing_zeros() as usize;
+            let piece = bishops & (!bishops + 1);
+            bb |= pseudo_bishop(piece, all, index);
+            bishops &= bishops - 1;
+        }
+
+        while rooks != 0 {
+            let index = 63 - NonZeroU64::new(rooks).unwrap().trailing_zeros() as usize;
+            let piece = rooks & (!rooks + 1);
+            bb |= pseudo_rook(piece, all, index);
+            rooks &= rooks - 1;
+        }
+
+        bb
+    }
+
+    pub fn get_pinned_bitboard(&self, king: u64, king_index: usize) -> u64 {
+        let mut pinned = 0;
+
+        let diag_snipers = self.enemy & (self.bishops | self.queens);
+        let line_snipers = self.enemy & (self.rooks | self.queens);
+
+        let blockers = pseudo_queen(king, self.all, king_index) & self.all;
+        let cleared = self.all ^ (blockers & self.player);
+
+        let mut snipers = ((pseudo_rook(king, cleared, king_index) & line_snipers)
+            | (pseudo_bishop(king, cleared, king_index) & diag_snipers)) & !blockers;
+
+        while snipers != 0 {
+            let piece = NonZeroU64::new(snipers & (!snipers + 1)).unwrap();
+            pinned |= blockers & RAYS[king_index][index!(piece)];
+            snipers &= snipers - 1;
+        }
+
+        pinned
+    }
+
+    pub fn get_evasion_mask(&self, king: u64, king_index: usize) -> u64 {
+
+        let attacking_pawns = LUT_PAWN_CAPTURES[!self.state.turn as usize][king_index] & self.enemy & self.pawns;
+
+        let attacking_knights = pseudo_knight(king_index) & self.enemy & self.knights;
+
+        let bishops = self.enemy & (self.bishops | self.queens);
+        let attacking_bishops = pseudo_bishop(king, self.all, king_index) & bishops;
+
+        let rooks = self.enemy & (self.rooks | self.queens);
+        let attacking_rooks = pseudo_rook(king, self.all, king_index) & rooks;
+
+        let attackers_mask = attacking_pawns | attacking_knights | attacking_bishops | attacking_rooks;
+
+        return if attackers_mask & (attackers_mask - 1) == 0 {
+            if attacking_bishops != 0 {
+                let attacker_index = index!(NonZeroU64::new(attacking_bishops).unwrap());
+                pseudo_bishop(king, self.all, king_index)
+                    & pseudo_bishop(attacking_bishops, self.all, attacker_index)
+                    | attacking_bishops
+            } else if attacking_rooks != 0 {
+                let attacker_index = index!(NonZeroU64::new(attacking_rooks).unwrap());
+                pseudo_rook(king, self.all, king_index)
+                    & pseudo_rook(attacking_rooks, self.all, attacker_index)
+                    | attacking_rooks
+            } else {
+                attackers_mask
+            }
+        } else {
+            0
+        }
+    }
+
+    pub fn generate(&mut self, es: &mut EngineState) {
+        let king = self.player & self.kings;
+        let king_index = index!(NonZeroU64::new(king).unwrap());
+        let shift_offset = (self.state.turn as u8) << 4;
+
+        let enemy_attacks = self.get_attack_bitboard(self.enemy, shift_offset ^ 16);
+
+        let evasion_mask;
         let space = !self.player;
-        let rank4 = RANKS[4 - self.state.turn as usize];
 
-        let pawns = self.player & self.sets[0] & !pinned;
-        let mut knights = self.player & self.sets[1] & !pinned;
-        let mut bishops = self.player & self.sets[2] & !pinned;
-        let mut rooks = self.player & self.sets[3] & !pinned;
-        let mut queens = self.player & self.sets[4] & !pinned;
-        let king = self.player & self.sets[5];
-
-        let mut king_moves = pseudo_king(king) & space & !enemy_attacks;
-        let originu8 = indexu8!(king);
+        let mut king_moves = pseudo_king(king_index) & space & !enemy_attacks;
         while king_moves != 0 {
-            let target = king_moves & 0u64.wrapping_sub(king_moves);
-            self.push_move(sc, originu8, indexu8!(target), 5, 0);
+            self.push_move(es, king, king_moves & (!king_moves + 1), 5);
             king_moves &= king_moves - 1;
         }
 
         if enemy_attacks & king != 0 {
-            evasion_mask = get_evasion_mask(&self);
+            evasion_mask = self.get_evasion_mask(king, king_index);
+        } else {
+            evasion_mask = !0u64;
+
+            let castle_bit = if self.state.turn { WHITE_SHORT_CASTLE } else { BLACK_SHORT_CASTLE };
+            if self.state.castle_flags & castle_bit != 0 {
+                let king_slide = (king >> 1) | (king >> 2);
+                if king_slide & (enemy_attacks | self.all) == 0 {
+                    self.push_move_with_code(es, king, king >> 2, 5, 6);
+                }
+            }
+            if self.state.castle_flags & (castle_bit << 1) != 0 {
+                let king_slide = (king << 1) | (king << 2);
+                let rook_slide = king_slide | (king << 3);
+                if king_slide & enemy_attacks == 0 && rook_slide & self.all == 0 {
+                    self.push_move_with_code(es, king, king << 2, 5, 7);
+                }
+            }
+
         }
 
         if evasion_mask != 0 {
-            let mut single_push = pseudo_push(pawns, self.all, self.state.forward) & evasion_mask;
-            let mut double_push = pseudo_push(single_push, self.all, self.state.forward) & rank4 & evasion_mask;
-            let mut left_captures = pseudo_left_capture(pawns, self.state.forward) & self.enemy  & evasion_mask;
-            let mut right_captures = pseudo_right_capture(pawns , self.state.forward) & self.enemy & evasion_mask;
 
-            while single_push != 0 {
-                let target = single_push & 0u64.wrapping_sub(single_push);
-                let origin = shift_left(target, self.state.forward);
-                self.push_move(sc, indexu8!(origin), indexu8!(target), 0, 0);
-                single_push &= single_push - 1;
+            let move_mask = evasion_mask & space;
+            let pinned = self.get_pinned_bitboard(king, king_index);
+            let free = self.player & !pinned;
+
+            let pawns = free & self.pawns;
+            let mut knights = free & self.knights;
+            let mut bishops = free & self.bishops;
+            let mut rooks = free & self.rooks;
+            let mut queens = free & self.queens;
+
+            if self.state.turn {
+                let mut single_push = ((pawns | (self.pawns & pinned & FILES[king_index & 7])) >> 8) & !self.all;
+                let mut double_push = ((single_push) >> 8) & RANKS[3] & evasion_mask & !self.all;
+                let mut left_captures = ((pawns | (self.pawns & pinned & ANTIDIAGS[king_index])) >> 7) & !FILES[7] & evasion_mask & self.enemy;
+                let mut right_captures = ((pawns | (self.pawns & pinned & DIAGONALS[king_index])) >> 9) & !FILES[0] & evasion_mask & self.enemy;
+                single_push &= evasion_mask;
+
+
+                if pawns & RANKS[6] != 0 {
+                    let rank8 = RANKS[7];
+                    let mut single_promo = single_push & rank8;
+                    let mut left_capture_promo = left_captures & rank8;
+                    let mut right_capture_promo = right_captures & rank8;
+
+                    single_push &= !rank8;
+                    left_captures &= !rank8;
+                    right_captures &= !rank8;
+
+                    while single_promo != 0 {
+                        let target = single_promo & (!single_promo + 1);
+                        let origin = target << 8;
+                        self.push_move_with_code(es, origin, target, 0, 1);
+                        self.push_move_with_code(es, origin, target, 0, 2);
+                        self.push_move_with_code(es, origin, target, 0, 3);
+                        self.push_move_with_code(es, origin, target, 0, 4);
+                        single_promo &= single_promo - 1;
+                    }
+
+                    while left_capture_promo != 0 {
+                        let target = left_capture_promo & (!left_capture_promo + 1);
+                        let origin = target << 7;
+                        self.push_move_with_code(es, origin, target, 0, 1);
+                        self.push_move_with_code(es, origin, target, 0, 2);
+                        self.push_move_with_code(es, origin, target, 0, 3);
+                        self.push_move_with_code(es, origin, target, 0, 4);
+                        left_capture_promo &= left_capture_promo - 1;
+                    }
+
+                    while right_capture_promo != 0 {
+                        let target = right_capture_promo & (!right_capture_promo + 1);
+                        let origin = target << 9;
+                        self.push_move_with_code(es, origin, target, 0, 1);
+                        self.push_move_with_code(es, origin, target, 0, 2);
+                        self.push_move_with_code(es, origin, target, 0, 3);
+                        self.push_move_with_code(es, origin, target, 0, 4);
+                        right_capture_promo &= right_capture_promo - 1;
+                    }
+                }
+
+
+                let ps = self.state.en_passant;
+                if ps & evasion_mask != 0 {
+                    let left_capturer = (ps << 1) & !FILES[7] & self.pawns & self.player;
+                    let right_capturer = (ps >> 1) & !FILES[0] & self.pawns & self.player;
+
+                    if left_capturer != 0 && (left_capturer & pinned == 0 || left_capturer & DIAGONALS[king_index] != 0) {
+                        let target = ps >> 8;
+                        let en_passant_mask = left_capturer | ps | target;
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(es, left_capturer, target, 0, 8);
+                        }
+                    }
+
+                    if right_capturer != 0 && (right_capturer & pinned == 0 || right_capturer & ANTIDIAGS[king_index] != 0) {
+                        let target = ps >> 8;
+                        let en_passant_mask = right_capturer | ps | target;
+
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(es, right_capturer, target, 0, 8);
+                        }
+                    }
+                }
+
+
+
+                while single_push != 0 {
+                    let target = single_push & (!single_push + 1);
+                    let origin = target << 8;
+                    self.push_move(es, origin, target, 0);
+                    single_push &= single_push - 1;
+                }
+
+                while double_push != 0 {
+                    let target = double_push & (!double_push + 1);
+                    let origin = target << 16;
+                    self.push_move_with_code(es, origin, target, 0, 5);
+                    double_push &= double_push - 1;
+                }
+
+                while left_captures != 0 {
+                    let target = left_captures & (!left_captures + 1);
+                    let origin = target << 7;
+                    self.push_move(es, origin, target, 0);
+                    left_captures &= left_captures - 1;
+                }
+
+                while right_captures != 0 {
+                    let target = right_captures & (!right_captures + 1);
+                    let origin = target << 9;
+                    self.push_move(es, origin, target, 0);
+                    right_captures &= right_captures - 1;
+                }
             }
 
-            let double_push_offset = self.state.forward * 2;
-            while double_push != 0 {
-                let target = double_push & 0u64.wrapping_sub(double_push);
-                let origin = shift_left(target, double_push_offset);
-                self.push_move(sc, indexu8!(origin), indexu8!(target), 0, 5);
-                double_push &= double_push - 1;
-            }
+            else {
+                let mut single_push = ((pawns | (self.pawns & pinned & FILES[king_index & 7])) << 8) & !self.all;
+                let mut double_push = ((single_push) << 8) & RANKS[4] & evasion_mask & !self.all;
+                let mut left_captures = ((pawns | (self.pawns & pinned & DIAGONALS[king_index])) << 9) & !FILES[7] & evasion_mask & self.enemy;
+                let mut right_captures = ((pawns | (self.pawns & pinned & ANTIDIAGS[king_index])) << 7) & !FILES[0] & evasion_mask & self.enemy;
+                single_push &= evasion_mask;
 
-            let left_capture_offset = self.state.forward - 1;
-            while left_captures != 0 {
-                let target = left_captures & 0u64.wrapping_sub(left_captures);
-                let origin = shift_left(target, left_capture_offset);
-                self.push_move(sc, indexu8!(origin), indexu8!(target), 0, 0);
-                left_captures &= left_captures - 1;
-            }
 
-            let right_capture_offset = self.state.forward + 1;
-            while right_captures != 0 {
-                let target = right_captures & 0u64.wrapping_sub(right_captures);
-                let origin = shift_left(target, right_capture_offset);
-                self.push_move(sc, indexu8!(origin), indexu8!(target), 0, 0);
-                right_captures &= right_captures - 1;
+                if pawns & RANKS[1] != 0 {
+                    let rank8 = RANKS[0];
+                    let mut single_promo = single_push & rank8;
+                    let mut left_capture_promo = left_captures & rank8;
+                    let mut right_capture_promo = right_captures & rank8;
+
+                    single_push &= !rank8;
+                    left_captures &= !rank8;
+                    right_captures &= !rank8;
+
+                    while single_promo != 0 {
+                        let target = single_promo & (!single_promo + 1);
+                        let origin = target >> 8;
+                        self.push_move_with_code(es, origin, target, 0, 1);
+                        self.push_move_with_code(es, origin, target, 0, 2);
+                        self.push_move_with_code(es, origin, target, 0, 3);
+                        self.push_move_with_code(es, origin, target, 0, 4);
+                        single_promo &= single_promo - 1;
+                    }
+
+                    while left_capture_promo != 0 {
+                        let target = left_capture_promo & (!left_capture_promo + 1);
+                        let origin = target >> 9;
+                        self.push_move_with_code(es, origin, target, 0, 1);
+                        self.push_move_with_code(es, origin, target, 0, 2);
+                        self.push_move_with_code(es, origin, target, 0, 3);
+                        self.push_move_with_code(es, origin, target, 0, 4);
+                        left_capture_promo &= left_capture_promo - 1;
+                    }
+
+                    while right_capture_promo != 0 {
+                        let target = right_capture_promo & (!right_capture_promo + 1);
+                        let origin = target >> 7;
+                        self.push_move_with_code(es, origin, target, 0, 1);
+                        self.push_move_with_code(es, origin, target, 0, 2);
+                        self.push_move_with_code(es, origin, target, 0, 3);
+                        self.push_move_with_code(es, origin, target, 0, 4);
+                        right_capture_promo &= right_capture_promo - 1;
+                    }
+                }
+
+
+                let ps = self.state.en_passant;
+                if ps & evasion_mask != 0 {
+                    let left_capturer = (ps << 1) & !FILES[7] & self.pawns & self.player;
+                    let right_capturer = (ps >> 1) & !FILES[0] & self.pawns & self.player;
+
+                    if left_capturer != 0 && (left_capturer & pinned == 0 || left_capturer & ANTIDIAGS[king_index] != 0) {
+                        let target = ps << 8;
+                        let en_passant_mask = left_capturer | ps | target;
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(es, left_capturer, target, 0, 8);
+                        }
+                    }
+
+                    if right_capturer != 0 && (right_capturer & pinned == 0 || right_capturer & DIAGONALS[king_index] != 0) {
+                        let target = ps << 8;
+                        let en_passant_mask = right_capturer | ps | target;
+
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(es, right_capturer, target, 0, 8);
+                        }
+                    }
+                }
+
+
+
+                while single_push != 0 {
+                    let target = single_push & (!single_push + 1);
+                    let origin = target >> 8;
+                    self.push_move(es, origin, target, 0);
+                    single_push &= single_push - 1;
+                }
+
+                while double_push != 0 {
+                    let target = double_push & (!double_push + 1);
+                    let origin = target >> 16;
+                    self.push_move_with_code(es, origin, target, 0, 5);
+                    double_push &= double_push - 1;
+                }
+
+                while left_captures != 0 {
+                    let target = left_captures & (!left_captures + 1);
+                    let origin = target >> 9;
+                    self.push_move(es, origin, target, 0);
+                    left_captures &= left_captures - 1;
+                }
+
+                while right_captures != 0 {
+                    let target = right_captures & (!right_captures + 1);
+                    let origin = target >> 7;
+                    self.push_move(es, origin, target, 0);
+                    right_captures &= right_captures - 1;
+                }
             }
 
             while knights != 0 {
-                let piece = knights & 0u64.wrapping_sub(knights);
-                let originu8 = indexu8!(piece);
-                let mut moves = pseudo_knight(piece) & space & evasion_mask;
+                let origin = knights & (!knights + 1);
+                let index = NonZeroU64::new(origin).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_knight(index) & move_mask;
                 while moves != 0 {
-                    let target = moves & 0u64.wrapping_sub(moves);
-                    self.push_move(sc, originu8, indexu8!(target), 1, 0);
+                    self.push_move(es, origin, moves & (!moves + 1), 1);
                     moves &= moves - 1;
                 }
                 knights &= knights - 1;
             }
 
             while bishops != 0 {
-                let piece = bishops & 0u64.wrapping_sub(bishops);
-                let originu8 = indexu8!(piece);
-                let mut moves = pseudo_bishop(piece, self.all) & space & evasion_mask;
+                let piece = bishops & (!bishops + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_bishop(piece, self.all, origin_index) & move_mask;
                 while moves != 0 {
-                    let target = moves & 0u64.wrapping_sub(moves);
-                    self.push_move(sc, originu8, indexu8!(target), 2, 0);
+                    self.push_move(es, piece, moves & (!moves + 1), 2);
                     moves &= moves - 1;
                 }
                 bishops &= bishops - 1;
             }
 
             while rooks != 0 {
-                let piece = rooks & 0u64.wrapping_sub(rooks);
-                let originu8 = indexu8!(piece);
-                let mut moves = pseudo_rook(piece, self.all) & space & evasion_mask;
+                let piece = rooks & (!rooks + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_rook(piece, self.all, origin_index) & move_mask;
                 while moves != 0 {
-                    let target = moves & 0u64.wrapping_sub(moves);
-                    self.push_move(sc, originu8, indexu8!(target), 3, 0);
+                    self.push_move(es, piece, moves & (!moves + 1), 3);
                     moves &= moves - 1;
                 }
                 rooks &= rooks - 1;
             }
 
+
             while queens != 0 {
-                let piece = queens & 0u64.wrapping_sub(queens);
-                let originu8 = indexu8!(piece);
-                let mut moves = pseudo_queen(piece, self.all) & space & evasion_mask;
+                let piece = queens & (!queens + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_queen(piece, self.all, origin_index) & move_mask;
                 while moves != 0 {
-                    let target = moves & 0u64.wrapping_sub(moves);
-                    self.push_move(sc, originu8, indexu8!(target), 4, 0);
+                    self.push_move(es, piece, moves & (!moves + 1), 4);
                     moves &= moves - 1;
                 }
                 queens &= queens - 1;
+            }
+
+            if evasion_mask == !0u64 {
+                let line_pins = pinned & (LUT_ROOK[king_index]);
+                let mut line_sliders = self.player & self.rooks & line_pins;
+                while line_sliders != 0 {
+                    let piece = line_sliders & (!line_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index];
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(es, piece, target, 3);
+                        moves &= moves - 1;
+                    }
+                    line_sliders &= line_sliders - 1;
+                }
+
+                let mut line_sliders = self.player & self.queens & line_pins;
+                while line_sliders != 0 {
+                    let piece = line_sliders & (!line_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index];
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(es, piece, target, 4);
+                        moves &= moves - 1;
+                    }
+                    line_sliders &= line_sliders - 1;
+                }
+
+                let diag_pins = pinned & (LUT_BISHOP[king_index]);
+
+                let mut diag_sliders = self.player & self.bishops & diag_pins;
+                while diag_sliders != 0 {
+                    let piece = diag_sliders & (!diag_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index];
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(es, piece, target, 2);
+                        moves &= moves - 1;
+                    }
+                    diag_sliders &= diag_sliders - 1;
+                }
+
+                let mut diag_sliders = self.player & self.queens & diag_pins;
+                while diag_sliders != 0 {
+                    let piece = diag_sliders & (!diag_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index];
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(es, piece, target, 4);
+                        moves &= moves - 1;
+                    }
+                    diag_sliders &= diag_sliders - 1;
+                }
             }
         }
     }
 
     pub fn make_move(&self, m: Move) -> Position {
-        let mut pos = self.next();
-
-        let origin = m.origin_bb();
-        let target = m.target_bb();
+        let origin = m.origin;
+        let target = m.target;
         let tier = m.tier();
         let move_mask = origin | target;
 
-        pos.sets[0] &= !move_mask;
-        pos.sets[1] &= !move_mask;
-        pos.sets[2] &= !move_mask;
-        pos.sets[3] &= !move_mask;
-        pos.sets[4] &= !move_mask;
-        pos.sets[5] &= !move_mask;
-        pos.sets[tier] |= target;
+        let mut pos = self.next(!move_mask);
+
+        match tier {
+            0 => pos.pawns |= target,
+            1 => pos.knights |= target,
+            2 => pos.bishops |= target,
+            3 => pos.rooks |= target,
+            4 => pos.queens |= target,
+            5 => pos.kings |= target,
+            _ => {}
+        }
 
         pos.all ^= origin;
         pos.all |= target;
-
         pos.player ^= move_mask;
-
         pos.enemy &= !target;
 
         match m.code {
@@ -290,14 +696,29 @@ impl Position {
             0 => {}
 
             // Promotions
-            1 | 2 | 3 | 4 => {
-                pos.sets[0] &= !target;
-                pos.sets[m.code as usize] |= target;
+            1 => {
+                pos.pawns &= !target;
+                pos.knights |= target;
+            }
+
+            2 => {
+                pos.pawns &= !target;
+                pos.bishops |= target;
+            }
+
+            3 => {
+                pos.pawns &= !target;
+                pos.rooks |= target;
+            }
+
+            4 => {
+                pos.pawns &= !target;
+                pos.queens |= target;
             }
 
             // Double pushes
             5 => {
-                pos.state.en_passant = shift_left(origin, self.state.forward);
+                pos.state.en_passant = target;
             }
 
             // Short castle
@@ -305,7 +726,7 @@ impl Position {
                 let rook_mask = (target << 1) | (target >> 1);
                 pos.all ^= rook_mask;
                 pos.player ^= rook_mask;
-                pos.sets[3] ^= rook_mask;
+                pos.rooks ^= rook_mask;
             }
 
             // Long castle
@@ -313,40 +734,37 @@ impl Position {
                 let rook_mask = (target << 2) | (target >> 1);
                 pos.all ^= rook_mask;
                 pos.player ^= rook_mask;
-                pos.sets[3] ^= rook_mask;
+                pos.rooks ^= rook_mask;
             }
 
             // En-passant
             8 => {
-                let captured_pawn = shift_right(self.state.en_passant, self.state.forward);
-                pos.all ^= captured_pawn;
-                pos.sets[0] ^= captured_pawn;
+                pos.all ^= self.state.en_passant;
+                pos.enemy ^= self.state.en_passant;
+                pos.rooks ^= self.state.en_passant;
             }
 
             _ => {}
         }
 
-        match m.origin {
-            0 => pos.state.castle_flags &= !WHITE_LONG_CASTLE,
-            4 => pos.state.castle_flags &= !WHITE_CASTLES,
-            7 => pos.state.castle_flags &= !WHITE_SHORT_CASTLE,
-            56 => pos.state.castle_flags &= !BLACK_LONG_CASTLE,
-            60 => pos.state.castle_flags &= !BLACK_CASTLES,
-            63 => pos.state.castle_flags &= !BLACK_SHORT_CASTLE,
-            _ => {}
-        }
+        let wsc_flag = (move_mask & WHITE_SHORT_CASTLE_BITS == 0) as u8;
+        let wlc_flag = (move_mask & WHITE_LONG_CASTLE_BITS == 0) as u8;
+        let bsc_flag = (move_mask & BLACK_SHORT_CASTLE_BITS == 0) as u8;
+        let blc_flag = (move_mask & BLACK_LONG_CASTLE_BITS == 0) as u8;
 
-        match m.target {
-            0 => pos.state.castle_flags &= !WHITE_LONG_CASTLE,
-            7 => pos.state.castle_flags &= !WHITE_SHORT_CASTLE,
-            56 => pos.state.castle_flags &= !BLACK_LONG_CASTLE,
-            63 => pos.state.castle_flags &= !BLACK_SHORT_CASTLE,
-            _ => {}
-        }
-
+        pos.state.castle_flags &= wsc_flag | (wlc_flag << 1) | (bsc_flag << 2) | (blc_flag << 3);
         pos.enemy = pos.player;
         pos.player = pos.all ^ pos.enemy;
 
         pos
+    }
+
+    pub fn print_moves(&self, es: &EngineState) {
+        let mut i = self.state.move_ptr;
+        while i < self.state.move_ptr + self.state.move_cnt {
+            let m = es.move_table[i];
+            if m.origin != m.target { m.print() }
+            i += 1;
+        }
     }
 }

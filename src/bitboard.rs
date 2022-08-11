@@ -90,6 +90,9 @@ pub const RAYS:              [[u64; 64]; 64] = get_rays_lut();
 pub const LUT_KNIGHT:        [u64; 64]       = get_lut_knight();
 pub const LUT_KING:          [u64; 64]       = get_lut_king();
 pub const LUT_PAWN_CAPTURES: [[u64; 64]; 2]  = get_lut_pawn_captures();
+pub const LUT_BISHOP:        [u64; 64]       = get_lut_bishop();
+pub const LUT_ROOK:          [u64; 64]       = get_lut_rook();
+pub const LUT_RANK_SLIDE:    [[u64; 256]; 8]  = get_lut_rank_slide();
 
 // LUT for single bits
 const fn get_bit_lut() -> [u64; 64] {
@@ -112,8 +115,7 @@ const fn get_diagonals() -> [u64; 64] {
     let mut i:   usize     = 0;
 
     loop {
-        let j = i as i32;
-        arr[i] = DIAGONALS_TEMPLATE[(((56 ^ j & 56) >> 3) + (j & 7)) as usize];
+        arr[i] = DIAGONALS_TEMPLATE[((56 ^ i & 56) >> 3) + (i & 7)];
 
         i += 1;
         if i == 64 { break }
@@ -127,8 +129,7 @@ const fn get_antidiags() -> [u64; 64] {
     let mut i:   usize     = 0;
 
     loop {
-        let j = i as i32;
-        arr[i] = ANTIDIAGS_TEMPLATE[(((j & 56) >> 3) + (j & 7)) as usize];
+        arr[i] = ANTIDIAGS_TEMPLATE[((i & 56) >> 3) + (i & 7)];
 
         i += 1;
         if i == 64 { break }
@@ -182,6 +183,32 @@ pub const fn get_rays_lut() -> [[u64; 64]; 64]{
             if j == 64 { break }
         }
 
+        i += 1;
+        if i == 64 { break }
+    }
+    arr
+}
+
+const fn get_lut_bishop() -> [u64; 64] {
+    let mut arr: [u64; 64] = [0; 64];
+    let mut i:   usize     = 0;
+
+    loop {
+        arr[i] |= DIAGONALS_TEMPLATE[((56 ^ i & 56) >> 3) + (i & 7)];
+        arr[i] |= ANTIDIAGS_TEMPLATE[((i & 56) >> 3) + (i & 7)];
+        i += 1;
+        if i == 64 { break }
+    }
+    arr
+}
+
+const fn get_lut_rook() -> [u64; 64] {
+    let mut arr: [u64; 64] = [0; 64];
+    let mut i:   usize     = 0;
+
+    loop {
+        arr[i] |= FILES[i & 7];
+        arr[i] |= RANKS[i >> 3];
         i += 1;
         if i == 64 { break }
     }
@@ -272,5 +299,32 @@ const fn get_lut_pawn_captures() -> [[u64; 64]; 2] {
         if i == 64 { break }
     }
 
+    lut
+}
+
+const fn get_lut_rank_slide() -> [[u64; 256]; 8] {
+    let mut lut: [[u64; 256]; 8] = [[0; 256]; 8];
+
+    let mut r = 0;
+    loop {
+        let mut i: u64 = 0;
+        loop {
+            let p = BITS[56+r];
+            let msb1  = BITS[0] >> ((p - 1) & i | 1).leading_zeros();
+            let slide   = ((i.wrapping_sub(p << 1) ^ i) | (p - msb1)) & 0xFF;
+
+            lut[r as usize][i as usize] = slide;
+
+            i += 1;
+            if i == 256 {
+                break
+            }
+        }
+
+        r += 1;
+        if r == 8 {
+            break
+        }
+    }
     lut
 }
