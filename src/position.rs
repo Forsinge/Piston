@@ -1,6 +1,6 @@
 use std::num::NonZeroU64;
 use piston::{index};
-use crate::state::{MAX_MOVE_COUNT, EngineState};
+use crate::state::{MAX_MOVE_COUNT};
 use crate::bitboard::{ANTIDIAGS, BITS, DIAGONALS, FILES, LUT_BISHOP, LUT_KING, LUT_KNIGHT, LUT_PAWN_CAPTURES, LUT_ROOK, RANKS, RAYS};
 use crate::movegen::*;
 use crate::output::{string_to_index, Display};
@@ -167,13 +167,13 @@ impl Position {
         }
     }
 
-    pub fn push_move_with_code(&mut self, es: &mut EngineState, origin: u64, target: u64, tier: u8, code: u8) {
-        es.move_table[self.state.move_ptr + self.state.move_cnt] = Move { origin, target, tier, code };
+    pub fn push_move_with_code(&mut self, move_slice: &mut [Move], origin: u64, target: u64, tier: u8, code: u8) {
+        move_slice[self.state.move_cnt] = Move { origin, target, tier, code };
         self.state.move_cnt += 1;
     }
 
-    pub fn push_move(&mut self, es: &mut EngineState, origin: u64, target: u64, tier: u8) {
-        es.move_table[self.state.move_ptr + self.state.move_cnt] = Move { origin, target, tier, code: 0};
+    pub fn push_move(&mut self, move_slice: &mut [Move], origin: u64, target: u64, tier: u8) {
+        move_slice[self.state.move_cnt] = Move { origin, target, tier, code: 0};
         self.state.move_cnt += 1;
     }
 
@@ -302,7 +302,7 @@ impl Position {
         }
     }
 
-    pub fn generate(&mut self, es: &mut EngineState) {
+    pub fn generate(&mut self, move_slice: &mut[Move]) {
         let king = self.player & self.kings;
         let king_index = index!(NonZeroU64::new(king).unwrap());
         let shift_offset = (self.state.turn as u8) << 4;
@@ -314,7 +314,7 @@ impl Position {
 
         let mut king_moves = pseudo_king(king_index) & space & !enemy_attacks;
         while king_moves != 0 {
-            self.push_move(es, king, king_moves & (!king_moves + 1), 5);
+            self.push_move(move_slice, king, king_moves & (!king_moves + 1), 5);
             king_moves &= king_moves - 1;
         }
 
@@ -327,14 +327,14 @@ impl Position {
             if self.state.castle_flags & castle_bit != 0 {
                 let king_slide = (king >> 1) | (king >> 2);
                 if king_slide & (enemy_attacks | self.all) == 0 {
-                    self.push_move_with_code(es, king, king >> 2, 5, 6);
+                    self.push_move_with_code(move_slice, king, king >> 2, 5, 6);
                 }
             }
             if self.state.castle_flags & (castle_bit << 1) != 0 {
                 let king_slide = (king << 1) | (king << 2);
                 let rook_slide = king_slide | (king << 3);
                 if king_slide & enemy_attacks == 0 && rook_slide & self.all == 0 {
-                    self.push_move_with_code(es, king, king << 2, 5, 7);
+                    self.push_move_with_code(move_slice, king, king << 2, 5, 7);
                 }
             }
 
@@ -373,30 +373,30 @@ impl Position {
                     while single_promo != 0 {
                         let target = single_promo & (!single_promo + 1);
                         let origin = target << 8;
-                        self.push_move_with_code(es, origin, target, 0, 1);
-                        self.push_move_with_code(es, origin, target, 0, 2);
-                        self.push_move_with_code(es, origin, target, 0, 3);
-                        self.push_move_with_code(es, origin, target, 0, 4);
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
                         single_promo &= single_promo - 1;
                     }
 
                     while left_capture_promo != 0 {
                         let target = left_capture_promo & (!left_capture_promo + 1);
                         let origin = target << 7;
-                        self.push_move_with_code(es, origin, target, 0, 1);
-                        self.push_move_with_code(es, origin, target, 0, 2);
-                        self.push_move_with_code(es, origin, target, 0, 3);
-                        self.push_move_with_code(es, origin, target, 0, 4);
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
                         left_capture_promo &= left_capture_promo - 1;
                     }
 
                     while right_capture_promo != 0 {
                         let target = right_capture_promo & (!right_capture_promo + 1);
                         let origin = target << 9;
-                        self.push_move_with_code(es, origin, target, 0, 1);
-                        self.push_move_with_code(es, origin, target, 0, 2);
-                        self.push_move_with_code(es, origin, target, 0, 3);
-                        self.push_move_with_code(es, origin, target, 0, 4);
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
                         right_capture_promo &= right_capture_promo - 1;
                     }
                 }
@@ -412,7 +412,7 @@ impl Position {
                         let en_passant_mask = left_capturer | ps | target;
                         let line_sliders = self.enemy & (self.rooks | self.queens);
                         if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
-                            self.push_move_with_code(es, left_capturer, target, 0, 8);
+                            self.push_move_with_code(move_slice, left_capturer, target, 0, 8);
                         }
                     }
 
@@ -422,38 +422,36 @@ impl Position {
 
                         let line_sliders = self.enemy & (self.rooks | self.queens);
                         if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
-                            self.push_move_with_code(es, right_capturer, target, 0, 8);
+                            self.push_move_with_code(move_slice, right_capturer, target, 0, 8);
                         }
                     }
                 }
 
-
-
                 while single_push != 0 {
                     let target = single_push & (!single_push + 1);
                     let origin = target << 8;
-                    self.push_move(es, origin, target, 0);
+                    self.push_move(move_slice, origin, target, 0);
                     single_push &= single_push - 1;
                 }
 
                 while double_push != 0 {
                     let target = double_push & (!double_push + 1);
                     let origin = target << 16;
-                    self.push_move_with_code(es, origin, target, 0, 5);
+                    self.push_move_with_code(move_slice, origin, target, 0, 5);
                     double_push &= double_push - 1;
                 }
 
                 while left_captures != 0 {
                     let target = left_captures & (!left_captures + 1);
                     let origin = target << 7;
-                    self.push_move(es, origin, target, 0);
+                    self.push_move(move_slice, origin, target, 0);
                     left_captures &= left_captures - 1;
                 }
 
                 while right_captures != 0 {
                     let target = right_captures & (!right_captures + 1);
                     let origin = target << 9;
-                    self.push_move(es, origin, target, 0);
+                    self.push_move(move_slice, origin, target, 0);
                     right_captures &= right_captures - 1;
                 }
             }
@@ -479,30 +477,30 @@ impl Position {
                     while single_promo != 0 {
                         let target = single_promo & (!single_promo + 1);
                         let origin = target >> 8;
-                        self.push_move_with_code(es, origin, target, 0, 1);
-                        self.push_move_with_code(es, origin, target, 0, 2);
-                        self.push_move_with_code(es, origin, target, 0, 3);
-                        self.push_move_with_code(es, origin, target, 0, 4);
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
                         single_promo &= single_promo - 1;
                     }
 
                     while left_capture_promo != 0 {
                         let target = left_capture_promo & (!left_capture_promo + 1);
                         let origin = target >> 9;
-                        self.push_move_with_code(es, origin, target, 0, 1);
-                        self.push_move_with_code(es, origin, target, 0, 2);
-                        self.push_move_with_code(es, origin, target, 0, 3);
-                        self.push_move_with_code(es, origin, target, 0, 4);
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
                         left_capture_promo &= left_capture_promo - 1;
                     }
 
                     while right_capture_promo != 0 {
                         let target = right_capture_promo & (!right_capture_promo + 1);
                         let origin = target >> 7;
-                        self.push_move_with_code(es, origin, target, 0, 1);
-                        self.push_move_with_code(es, origin, target, 0, 2);
-                        self.push_move_with_code(es, origin, target, 0, 3);
-                        self.push_move_with_code(es, origin, target, 0, 4);
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
                         right_capture_promo &= right_capture_promo - 1;
                     }
                 }
@@ -518,7 +516,7 @@ impl Position {
                         let en_passant_mask = left_capturer | ps | target;
                         let line_sliders = self.enemy & (self.rooks | self.queens);
                         if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
-                            self.push_move_with_code(es, left_capturer, target, 0, 8);
+                            self.push_move_with_code(move_slice, left_capturer, target, 0, 8);
                         }
                     }
 
@@ -528,38 +526,36 @@ impl Position {
 
                         let line_sliders = self.enemy & (self.rooks | self.queens);
                         if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
-                            self.push_move_with_code(es, right_capturer, target, 0, 8);
+                            self.push_move_with_code(move_slice, right_capturer, target, 0, 8);
                         }
                     }
                 }
 
-
-
                 while single_push != 0 {
                     let target = single_push & (!single_push + 1);
                     let origin = target >> 8;
-                    self.push_move(es, origin, target, 0);
+                    self.push_move(move_slice, origin, target, 0);
                     single_push &= single_push - 1;
                 }
 
                 while double_push != 0 {
                     let target = double_push & (!double_push + 1);
                     let origin = target >> 16;
-                    self.push_move_with_code(es, origin, target, 0, 5);
+                    self.push_move_with_code(move_slice, origin, target, 0, 5);
                     double_push &= double_push - 1;
                 }
 
                 while left_captures != 0 {
                     let target = left_captures & (!left_captures + 1);
                     let origin = target >> 9;
-                    self.push_move(es, origin, target, 0);
+                    self.push_move(move_slice, origin, target, 0);
                     left_captures &= left_captures - 1;
                 }
 
                 while right_captures != 0 {
                     let target = right_captures & (!right_captures + 1);
                     let origin = target >> 7;
-                    self.push_move(es, origin, target, 0);
+                    self.push_move(move_slice, origin, target, 0);
                     right_captures &= right_captures - 1;
                 }
             }
@@ -569,7 +565,7 @@ impl Position {
                 let index = NonZeroU64::new(origin).unwrap().leading_zeros() as usize;
                 let mut moves = pseudo_knight(index) & move_mask;
                 while moves != 0 {
-                    self.push_move(es, origin, moves & (!moves + 1), 1);
+                    self.push_move(move_slice, origin, moves & (!moves + 1), 1);
                     moves &= moves - 1;
                 }
                 knights &= knights - 1;
@@ -580,7 +576,7 @@ impl Position {
                 let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
                 let mut moves = pseudo_bishop(piece, self.all, origin_index) & move_mask;
                 while moves != 0 {
-                    self.push_move(es, piece, moves & (!moves + 1), 2);
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 2);
                     moves &= moves - 1;
                 }
                 bishops &= bishops - 1;
@@ -591,7 +587,7 @@ impl Position {
                 let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
                 let mut moves = pseudo_rook(piece, self.all, origin_index) & move_mask;
                 while moves != 0 {
-                    self.push_move(es, piece, moves & (!moves + 1), 3);
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 3);
                     moves &= moves - 1;
                 }
                 rooks &= rooks - 1;
@@ -603,7 +599,7 @@ impl Position {
                 let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
                 let mut moves = pseudo_queen(piece, self.all, origin_index) & move_mask;
                 while moves != 0 {
-                    self.push_move(es, piece, moves & (!moves + 1), 4);
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 4);
                     moves &= moves - 1;
                 }
                 queens &= queens - 1;
@@ -618,7 +614,7 @@ impl Position {
                     let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index];
                     while moves != 0 {
                         let target = moves & (!moves + 1);
-                        self.push_move(es, piece, target, 3);
+                        self.push_move(move_slice, piece, target, 3);
                         moves &= moves - 1;
                     }
                     line_sliders &= line_sliders - 1;
@@ -631,7 +627,7 @@ impl Position {
                     let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index];
                     while moves != 0 {
                         let target = moves & (!moves + 1);
-                        self.push_move(es, piece, target, 4);
+                        self.push_move(move_slice, piece, target, 4);
                         moves &= moves - 1;
                     }
                     line_sliders &= line_sliders - 1;
@@ -646,7 +642,7 @@ impl Position {
                     let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index];
                     while moves != 0 {
                         let target = moves & (!moves + 1);
-                        self.push_move(es, piece, target, 2);
+                        self.push_move(move_slice, piece, target, 2);
                         moves &= moves - 1;
                     }
                     diag_sliders &= diag_sliders - 1;
@@ -659,7 +655,7 @@ impl Position {
                     let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index];
                     while moves != 0 {
                         let target = moves & (!moves + 1);
-                        self.push_move(es, piece, target, 4);
+                        self.push_move(move_slice, piece, target, 4);
                         moves &= moves - 1;
                     }
                     diag_sliders &= diag_sliders - 1;
@@ -759,10 +755,10 @@ impl Position {
         pos
     }
 
-    pub fn print_moves(&self, es: &EngineState) {
-        let mut i = self.state.move_ptr;
-        while i < self.state.move_ptr + self.state.move_cnt {
-            let m = es.move_table[i];
+    pub fn print_moves(&self, move_slice: &mut [Move]) {
+        let mut i = 0;
+        while i < self.state.move_cnt {
+            let m = move_slice[i];
             if m.origin != m.target { m.print() }
             i += 1;
         }

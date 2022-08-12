@@ -1,4 +1,4 @@
-use crate::state::EngineState;
+use crate::state::{SearchState};
 
 pub const TT_DEFAULT_SIZE: u64 = 2097152;
 pub const TT_DEFAULT_INDEX_BITS: u32 = 21;
@@ -63,14 +63,14 @@ impl TT {
         return None;
     }
 
-    pub unsafe fn place(&mut self, es: &EngineState, key: u64, eval: i16, outcome: u8, depth: u8, refutation: u32) {
-        let root_key_high = get_key_high(es.root_key);
+    pub unsafe fn place(&mut self, state: &SearchState, key: u64, eval: i16, outcome: u8, depth: u8, refutation: u32) {
+        let root_key_high = get_key_high(state.root_key);
         let key_high = get_key_high(key);
         let index = (key & self.mask) as usize;
         let stored = self.table[index];
 
         if stored.get_key() != root_key_high || key_high == root_key_high {
-            let entry = create_entry(key, eval, outcome, es.root_age, depth, refutation);
+            let entry = create_entry(key, eval, outcome, state.root_age, depth, refutation);
             self.table[index] = entry;
         }
     }
