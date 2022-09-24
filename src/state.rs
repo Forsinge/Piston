@@ -1,4 +1,5 @@
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
 use crate::position::{Move, Position, STARTPOS_FEN};
 use crate::tt::{create_tt, TT, TT_DEFAULT_SIZE};
 
@@ -6,6 +7,23 @@ pub const MAX_PLY: usize = 64;
 pub const MAX_MOVE_COUNT: usize = 256;
 pub const MOVE_TABLE_SIZE: usize = MAX_PLY * MAX_MOVE_COUNT;
 
+pub struct SearchStats {
+    pub perft_nodes: u64,
+    pub pvs_nodes: u64,
+    pub qs_nodes: u64,
+    pub beta_cutoffs: u64,
+}
+
+impl SearchStats {
+    pub fn new() -> SearchStats {
+        SearchStats {
+            perft_nodes: 0,
+            pvs_nodes: 0,
+            qs_nodes: 0,
+            beta_cutoffs: 0,
+        }
+    }
+}
 
 pub struct SearchState {
     pub root: Position,
@@ -13,8 +31,8 @@ pub struct SearchState {
     pub root_age: u8,
     pub hash_table: TT,
     pub move_table: [Move; MOVE_TABLE_SIZE],
-    pub node_count: u64,
     pub max_depth: u8,
+    pub stats: SearchStats,
 }
 
 impl SearchState {
@@ -25,8 +43,8 @@ impl SearchState {
             root_age: 0,
             hash_table: create_tt(TT_DEFAULT_SIZE),
             move_table: [Move::default(); MOVE_TABLE_SIZE],
-            node_count: 0,
             max_depth: 0,
+            stats: SearchStats::new(),
         }
     }
 }
@@ -34,6 +52,7 @@ impl SearchState {
 pub struct EngineState {
     pub root: Position,
     pub move_buffer: [Move; MAX_MOVE_COUNT],
+    pub terminate: Arc<AtomicBool>,
     pub search_state: Arc<Mutex<SearchState>>,
 }
 
@@ -42,6 +61,7 @@ impl EngineState {
         EngineState {
             root: Position::build_from_fen(STARTPOS_FEN),
             move_buffer: [Move::default(); MAX_MOVE_COUNT],
+            terminate: Arc::new(AtomicBool::new(false)),
             search_state: Arc::new(Mutex::new(SearchState::new())),
         }
     }

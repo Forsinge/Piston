@@ -9,6 +9,7 @@ mod search;
 mod uci;
 mod tt;
 mod hash;
+mod eval;
 
 fn main() {
     uci::uci_loop();

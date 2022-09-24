@@ -1,12 +1,15 @@
 use std::io::stdin;
-use std::ops::Deref;
+use std::ops::{Deref};
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::mpsc;
 use std::thread;
+use std::time::Instant;
 use crate::bitboard::BITS;
 use crate::output::string_to_index;
 use crate::position::{Move, Position, STARTPOS_FEN};
-use crate::state::{EngineState, MAX_MOVE_COUNT};
+use crate::state::{EngineState, MAX_MOVE_COUNT, SearchStats};
 use crate::output::Display;
-use crate::search::perft;
+use crate::search::{perft, pvs};
 
 const CMD_ERR: &str = "Error parsing command.";
 
@@ -44,6 +47,16 @@ pub fn handle_info_cmd(es: &EngineState, tokens: Vec<&str>) {
 
         "state" => es.root.state.print(),
 
+        "stats" => {
+            let ss_arc = es.search_state.clone();
+            let lock_result = ss_arc.try_lock();
+            if lock_result.is_ok() {
+                lock_result.unwrap().stats.print();
+            } else {
+                println!("Cannot access statistics during search.");
+            }
+        }
+
         "d" => es.root.print(),
 
         "pm" => {
@@ -53,7 +66,13 @@ pub fn handle_info_cmd(es: &EngineState, tokens: Vec<&str>) {
             pos.print_moves(&mut list[0..MAX_MOVE_COUNT]);
         }
 
-        "exit" => std::process::exit(0),
+        "exit" | "quit" => {
+            es.terminate.store(true, Relaxed);
+            std::process::exit(0);
+        }
+
+
+        "stop" => es.terminate.store(true, Relaxed),
 
         _ => {}
     }
@@ -109,13 +128,15 @@ pub fn handle_go(es: &mut EngineState, tokens: Vec<&str>) {
     let mut iter = tokens.into_iter();
     iter.next();
 
-    while let Some(token) = iter.next() {
+    'outer: while let Some(token) = iter.next() {
         match token {
 
             "perft" => {
                 let root_clone = es.root.clone();
                 let ss_arc = es.search_state.clone();
                 let depth = iter.next().unwrap_or("1").parse::<u8>().unwrap();
+
+
 
                 thread::spawn(move || {
                     let lock_result = ss_arc.try_lock();
@@ -124,20 +145,49 @@ pub fn handle_go(es: &mut EngineState, tokens: Vec<&str>) {
 
                         state.root = root_clone;
                         state.max_depth = depth;
-                        state.node_count = 0;
+                        state.stats = SearchStats::new();
 
                         perft(&mut state);
                     } else {
+                        println!("perft");
                         println!("A search is already in progress!");
                     }
                 });
             }
 
-            _ => {}
+            _ => {
+                let (sender, receiver) = mpsc::channel();
+                let root_clone = es.root.clone();
+                let ss_arc = es.search_state.clone();
+
+                thread::spawn(move || {
+                    let lock_result = ss_arc.try_lock();
+                    if lock_result.is_ok() {
+                        let mut state = lock_result.unwrap();
+
+                        state.root = root_clone;
+                        state.stats = SearchStats::new();
+
+                        pvs(&mut state, &receiver);
+                    } else {
+                        println!("pvs");
+                        println!("A search is already in progress!");
+                    }
+                });
+
+                let terminate_arc = es.terminate.clone();
+                thread::spawn(move || {
+                    let clock = Instant::now();
+                    while clock.elapsed().as_millis() < 5000 && !terminate_arc.load(Relaxed) {}
+                    sender.send(true).expect("Search thread has terminated unexpectedly.");
+                    terminate_arc.store(false, Relaxed);
+                });
+
+                break 'outer;
+            }
         }
     }
 }
-
 
 pub fn parse_move(root: &Position, m: &str) -> Move {
     let origin = BITS[string_to_index(&m[0..2])];
@@ -162,73 +212,3 @@ pub fn parse_move(root: &Position, m: &str) -> Move {
     }
     Move { origin, target, tier, code }
 }
-
-/*
-pub fn handle_command(mut state: MutexGuard<EngineState>, tokens: &Vec<&str>) {
-    if tokens.len() == 1 {
-        match tokens.get(0).unwrap().deref() {
-            "uci" => {
-                println!("id name Piston 0.7");
-                println!("id author Carl");
-                println!("uciok");
-            }
-
-            "isready" => println!("readyok"),
-
-            "state" => state.root.state.print(),
-
-            "d" => state.root.print(),
-
-            "pm" => {
-                let pos = &mut state.root.clone();
-                pos.generate(&mut state.move_table);
-                pos.print_moves(&mut state.move_table);
-            }
-
-            "exit" => std::process::exit(0),
-
-            _ => {}
-        }
-    }
-    if tokens.len() >= 2 {
-        match tokens.get(0).unwrap().deref() {
-            "position" => {
-                match tokens.get(1).unwrap().deref() {
-                    
-                    "startpos" => {
-                        let pos = Position::build_from_fen(STARTPOS_FEN);
-                        state.root = pos;
-                    }
-
-                    _ => {
-                        let fen_vec = Vec::from_iter(tokens[2..].iter().cloned());
-                        let fen = fen_vec.join(" ");
-                        let pos = Position::build_from_fen(fen.as_str());
-                        state.root = pos;
-                    }
-                }
-            }
-
-            "move" => {
-                let m = parse_move(&state.root, tokens.get(1).unwrap());
-                let mut pos = state.root.clone().make_move(m);
-                pos.state.move_ptr = 0;
-                state.root = pos;
-            }
-
-            "go" => {
-                match tokens.get(1).unwrap().deref() {
-                    "perft" => {
-                        state.max_depth = tokens.get(2).unwrap().deref().parse::<u8>().unwrap();
-                        perft(state);
-                    }
-                    _ => {}
-                }
-            }
-
-            _ => {},
-        }
-    }
-}
-
- */

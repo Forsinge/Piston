@@ -1,9 +1,11 @@
 extern crate colored;
 use colored::Colorize;
 use std::ops::Add;
+use std::sync::MutexGuard;
 use piston::index;
 use crate::bitboard::BITS;
 use crate::position::{BLACK_LONG_CASTLE, BLACK_SHORT_CASTLE, FILE_CHARS, Move, Position, PositionState, WHITE_LONG_CASTLE, WHITE_SHORT_CASTLE};
+use crate::state::{SearchState, SearchStats};
 
 pub fn string_to_index(str: &str) -> usize {
     if str == "-" {
@@ -51,7 +53,7 @@ impl Display for Move {
             let promos = " nbrq";
             print!("{}", &promos[self.code as usize..self.code as usize + 1]);
         }
-        println!();
+        print!(" ");
     }
 }
 
@@ -85,6 +87,8 @@ impl Display for Position {
 
 impl Display for PositionState {
     fn print(&self) {
+        println!("Key: {:x}", self.key);
+        println!("Material balance: {}", self.material_balance);
         println!("Turn: {}", self.turn);
         println!("Half move: {}", self.half_move);
         println!("White short castle: {}", self.castle_flags & WHITE_SHORT_CASTLE != 0);
@@ -94,5 +98,30 @@ impl Display for PositionState {
         println!("En-passant: {}", index_to_string(index!(self.en_passant)));
         println!("Move pointer: {}", self.move_ptr);
         println!("Move count: {}", self.move_cnt);
+    }
+}
+
+impl Display for SearchStats {
+    fn print(&self) {
+        println!("Perft-search nodes: {}", self.perft_nodes);
+        println!("PV-search nodes: {}", self.pvs_nodes);
+        println!("Q-search nodes: {}", self.qs_nodes);
+        println!("Beta cutoffs: {}", self.beta_cutoffs);
+    }
+}
+
+pub fn print_pv(root: &Position, state: &mut MutexGuard<SearchState>) {
+    print!("pv ");
+    let mut curr = root.clone();
+
+    while let Some(entry) = state.hash_table.probe(curr.state.key) {
+        let m = entry.get_refutation();
+
+        if m.origin == m.target {
+            break
+        }
+
+        m.print();
+        curr = curr.make_move(m);
     }
 }
