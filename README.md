@@ -3,7 +3,7 @@
 A revamped version of my old chess engine. The old version's playing strength was 
 somewhere around 2000 ELO. The project is in early development and still has 
 issues preventing from playing at that level, but its underlying speed is a lot 
-faster.
+higher.
 
 Quick description of Piston's features:
 
