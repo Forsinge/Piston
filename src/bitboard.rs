@@ -1,7 +1,3 @@
-/**************************|
-|*         UTILS          *|
-|**************************/
-
 pub const RANKS: [u64; 8] = [
     0xFF00000000000000,
     0x00FF000000000000,
@@ -56,6 +52,16 @@ pub const ANTIDIAGS_TEMPLATE: [u64; 15] = [
     0x0000000000000102,
     0x0000000000000001];
 
+pub const BITS:              [u64; 64]       = get_bit_lut();
+pub const DIAGONALS:         [u64; 64]       = get_diagonals();
+pub const ANTIDIAGS:         [u64; 64]       = get_antidiags();
+pub const RAYS:              [[u64; 64]; 64] = get_rays_lut();
+pub const LUT_KNIGHT:        [u64; 64]       = get_lut_knight();
+pub const LUT_KING:          [u64; 64]       = get_lut_king();
+pub const LUT_PAWN_CAPTURES: [[u64; 64]; 2]  = get_lut_pawn_captures();
+pub const LUT_BISHOP:        [u64; 64]       = get_lut_bishop();
+pub const LUT_ROOK:          [u64; 64]       = get_lut_rook();
+pub const LUT_RANK_SLIDE:    [[u64; 256]; 8]  = get_lut_rank_slide();
 
 pub const CENTER: u64 = 0x0000001818000000;
 pub const WHITE_OFFENSIVE_ZONE: u64 = 0xFFFFFFFFFF000000;
@@ -77,22 +83,6 @@ pub const fn shift_forward(bb: u64, val: u8, color: bool) -> u64 {
 pub const fn shift_backward(bb: u64, val: u8, color: bool) -> u64 {
     if color {bb << val} else {bb >> val}
 }
-
-
-/**************************|
-|*     LOOKUP TABLES      *|
-|**************************/
-
-pub const BITS:              [u64; 64]       = get_bit_lut();
-pub const DIAGONALS:         [u64; 64]       = get_diagonals();
-pub const ANTIDIAGS:         [u64; 64]       = get_antidiags();
-pub const RAYS:              [[u64; 64]; 64] = get_rays_lut();
-pub const LUT_KNIGHT:        [u64; 64]       = get_lut_knight();
-pub const LUT_KING:          [u64; 64]       = get_lut_king();
-pub const LUT_PAWN_CAPTURES: [[u64; 64]; 2]  = get_lut_pawn_captures();
-pub const LUT_BISHOP:        [u64; 64]       = get_lut_bishop();
-pub const LUT_ROOK:          [u64; 64]       = get_lut_rook();
-pub const LUT_RANK_SLIDE:    [[u64; 256]; 8]  = get_lut_rank_slide();
 
 // LUT for single bits
 const fn get_bit_lut() -> [u64; 64] {
@@ -189,6 +179,7 @@ pub const fn get_rays_lut() -> [[u64; 64]; 64]{
     arr
 }
 
+// LUT for bishop attacks
 const fn get_lut_bishop() -> [u64; 64] {
     let mut arr: [u64; 64] = [0; 64];
     let mut i:   usize     = 0;
@@ -202,6 +193,7 @@ const fn get_lut_bishop() -> [u64; 64] {
     arr
 }
 
+// LUT for rook attacks
 const fn get_lut_rook() -> [u64; 64] {
     let mut arr: [u64; 64] = [0; 64];
     let mut i:   usize     = 0;
@@ -302,6 +294,7 @@ const fn get_lut_pawn_captures() -> [[u64; 64]; 2] {
     lut
 }
 
+// LUT for sliding attacks on rank
 const fn get_lut_rank_slide() -> [[u64; 256]; 8] {
     let mut lut: [[u64; 256]; 8] = [[0; 256]; 8];
 
