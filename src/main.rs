@@ -10,6 +10,7 @@ mod uci;
 mod tt;
 mod hash;
 mod eval;
+mod ordering;
 
 fn main() {
     uci::uci_loop();

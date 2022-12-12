@@ -66,6 +66,20 @@ pub fn handle_info_cmd(es: &EngineState, tokens: Vec<&str>) {
             pos.print_moves(&mut list[0..MAX_MOVE_COUNT]);
         }
 
+        "pt" => {
+            let pos = &mut es.root.clone();
+            let mut list = [Move::default(); MAX_MOVE_COUNT];
+            pos.generate_tactical(&mut list[0..MAX_MOVE_COUNT]);
+            pos.print_moves(&mut list[0..MAX_MOVE_COUNT]);
+        }
+
+        "pq" => {
+            let pos = &mut es.root.clone();
+            let mut list = [Move::default(); MAX_MOVE_COUNT];
+            pos.generate_quiet(&mut list[0..MAX_MOVE_COUNT]);
+            pos.print_moves(&mut list[0..MAX_MOVE_COUNT]);
+        }
+
         "exit" | "quit" => {
             es.terminate.store(true, Relaxed);
             std::process::exit(0);
@@ -132,27 +146,32 @@ pub fn handle_go(es: &mut EngineState, tokens: Vec<&str>) {
         match token {
 
             "perft" => {
-                let root_clone = es.root.clone();
-                let ss_arc = es.search_state.clone();
                 let depth = iter.next().unwrap_or("1").parse::<u8>().unwrap();
 
+                // temporary fix
+                if depth <= 1 {
+                    let pos = &mut es.root.clone();
+                    let mut list = [Move::default(); MAX_MOVE_COUNT];
+                    pos.generate(&mut list[0..MAX_MOVE_COUNT]);
+                    println!("Nodes searched: {}", pos.state.move_cnt)
+                } else {
+                    let root_clone = es.root.clone();
+                    let ss_arc = es.search_state.clone();
+                    thread::spawn(move || {
+                        let lock_result = ss_arc.try_lock();
+                        if lock_result.is_ok() {
+                            let mut state = lock_result.unwrap();
 
+                            state.root = root_clone;
+                            state.max_depth = depth;
+                            state.stats = SearchStats::new();
 
-                thread::spawn(move || {
-                    let lock_result = ss_arc.try_lock();
-                    if lock_result.is_ok() {
-                        let mut state = lock_result.unwrap();
-
-                        state.root = root_clone;
-                        state.max_depth = depth;
-                        state.stats = SearchStats::new();
-
-                        perft(&mut state);
-                    } else {
-                        println!("perft");
-                        println!("A search is already in progress!");
-                    }
-                });
+                            perft(&mut state);
+                        } else {
+                            println!("A search is already in progress!");
+                        }
+                    });
+                }
             }
 
             _ => {
@@ -170,7 +189,6 @@ pub fn handle_go(es: &mut EngineState, tokens: Vec<&str>) {
 
                         pvs(&mut state, &receiver);
                     } else {
-                        println!("pvs");
                         println!("A search is already in progress!");
                     }
                 });
@@ -178,7 +196,7 @@ pub fn handle_go(es: &mut EngineState, tokens: Vec<&str>) {
                 let terminate_arc = es.terminate.clone();
                 thread::spawn(move || {
                     let clock = Instant::now();
-                    while clock.elapsed().as_millis() < 5000 && !terminate_arc.load(Relaxed) {}
+                    while clock.elapsed().as_millis() < 4000 && !terminate_arc.load(Relaxed) {}
                     sender.send(true).expect("Search thread has terminated unexpectedly.");
                     terminate_arc.store(false, Relaxed);
                 });

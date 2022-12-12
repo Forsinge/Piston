@@ -88,7 +88,6 @@ impl Display for Position {
 impl Display for PositionState {
     fn print(&self) {
         println!("Key: {:x}", self.key);
-        println!("Material balance: {}", self.material_balance);
         println!("Turn: {}", self.turn);
         println!("Half move: {}", self.half_move);
         println!("White short castle: {}", self.castle_flags & WHITE_SHORT_CASTLE != 0);
@@ -107,6 +106,7 @@ impl Display for SearchStats {
         println!("PV-search nodes: {}", self.pvs_nodes);
         println!("Q-search nodes: {}", self.qs_nodes);
         println!("Beta cutoffs: {}", self.beta_cutoffs);
+        println!("TT hitrate: {}", self.table_hits as f64 / self.table_probes as f64);
     }
 }
 

@@ -2,6 +2,8 @@ use crate::position::Move;
 
 pub const TT_DEFAULT_SIZE: u64 = 2097152;
 pub const TT_DEFAULT_INDEX_BITS: u32 = 21;
+pub const BUCKET_SIZE: usize = 4;
+pub const BUCKET_MASK: u64 = !((BUCKET_SIZE as u64)-1);
 
 // Transposition table entry
 #[derive(Copy, Clone, Default)]
@@ -47,21 +49,35 @@ pub struct TT {
 
 impl TT {
     pub fn probe(&self, key: u64) -> Option<TTEntry> {
-        let index = (key & self.mask) as usize;
-        let stored = self.table[index];
+        let index = (key & self.mask & BUCKET_MASK) as usize;
 
-        if stored.get_key() == key {
-            return Some(stored);
+        for i in index..index+BUCKET_SIZE {
+            let stored = self.table[i];
+            if stored.get_key() == key {
+                return Some(stored);
+            }
         }
 
         return None;
     }
 
     pub fn place(&mut self, _root_key: u64, root_age: u8, key: u64, eval: i16, outcome: u8, depth: u8, refutation: u32) {
-        let index = (key & self.mask) as usize;
+        let index = (key & self.mask & BUCKET_MASK) as usize;
+
+        let mut lowest = u8::MAX;
+        let mut li = index;
+        for i in index..index+BUCKET_SIZE {
+            let depth = self.table[i].get_depth();
+            let recency = ((self.table[i].get_age() == root_age) as u8) << 1;
+            let value = depth + recency;
+            if value < lowest {
+                lowest = value;
+                li = i;
+            }
+        }
 
         let entry = create_entry(key, eval, outcome, root_age, depth, refutation);
-        self.table[index] = entry;
+        self.table[li] = entry;
     }
 
     pub fn reset(&mut self) {

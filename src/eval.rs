@@ -45,5 +45,16 @@ pub fn eval(pos: &Position) -> i16 {
         enemy_rooks &= enemy_rooks - 1;
     }
 
-    return pos.state.material_balance + player_mobility as i16 - enemy_mobility as i16;
+    let player_attacks = pos.get_attack_bitboard(pos.player, pos.player_shift_offset());
+
+    let player_obstruction = (player_attacks & pos.player).count_ones();
+    let enemy_obstruction = (pos.state.attack_mask & pos.player).count_ones();
+
+    return
+        pos.metrics.material_balance +
+        (pos.metrics.advancement >> 1) +
+        player_mobility as i16 -
+        player_obstruction as i16 +
+        enemy_obstruction as i16 -
+        enemy_mobility as i16;
 }

@@ -2,8 +2,10 @@ use std::sync::mpsc::Receiver;
 use std::sync::MutexGuard;
 use std::time::Instant;
 use crate::eval::{DRAW, LOSS, TERMINATE, eval};
+use crate::ordering::{add_killer, PVSPicker};
 use crate::output::{Display, print_pv};
 use crate::position::{Move, Position};
+use crate::ordering::PickerStage::*;
 use crate::state::{MAX_MOVE_COUNT, SearchState};
 
 pub fn pvs(state: &mut MutexGuard<SearchState>, receiver: &Receiver<bool>) {
@@ -11,9 +13,9 @@ pub fn pvs(state: &mut MutexGuard<SearchState>, receiver: &Receiver<bool>) {
 
     state.root_key = pos.state.key;
     state.root_age = pos.state.half_move;
+    state.max_depth = 64;
 
-
-    let slice = &mut state.move_table[0..MAX_MOVE_COUNT];
+    let slice = &mut state.move_table[pos.state.move_ptr..MAX_MOVE_COUNT];
     pos.generate(slice);
 
     let clock = Instant::now();
@@ -56,11 +58,16 @@ pub fn pvs(state: &mut MutexGuard<SearchState>, receiver: &Receiver<bool>) {
         println!();
 
         ordered_moves[0..pos.state.move_cnt].sort_by(|l, r | r.1.cmp(&l.1));
+
+        if depth == state.max_depth {
+            break 'outer;
+        }
+
         depth += 1;
     }
 
     print!("bestmove ");
-    bestmove.print();
+    state.hash_table.probe(state.root_key).unwrap().get_refutation().print();
     println!();
 }
 
@@ -77,27 +84,16 @@ pub fn pvs_internal(pos: &mut Position, state: &mut MutexGuard<SearchState>,
 
     state.stats.pvs_nodes += 1;
 
-    let slice = &mut state.move_table[pos.state.move_ptr..pos.state.move_ptr + MAX_MOVE_COUNT];
-    pos.generate(slice);
+    let mut ttmove = None;
 
-    if pos.state.move_cnt == 0 {
-        return if pos.is_attacked(pos.player & pos.kings) {
-            LOSS
-        } else {
-            DRAW
-        }
-    }
-
-    let mut ptr = pos.state.move_ptr;
-    let end = pos.state.move_ptr + pos.state.move_cnt;
-    let pvmove;
-
+    state.stats.table_probes += 1;
     if let Some(entry) = state.hash_table.probe(pos.state.key) {
+        state.stats.table_hits += 1;
         if beta == alpha + 1 && entry.get_depth() >= depth_left {
             let entryeval = entry.get_eval();
             let outcome = entry.get_outcome();
             if outcome == 1 {
-                return entryeval.clamp(alpha, beta);
+                return entryeval;
             }
             if outcome == 0 && entryeval <= alpha {
                 return alpha;
@@ -106,42 +102,21 @@ pub fn pvs_internal(pos: &mut Position, state: &mut MutexGuard<SearchState>,
                 return beta;
             }
         }
-        pvmove = entry.get_refutation();
-    } else {
-        pvmove = state.move_table[ptr];
-        ptr += 1;
+        ttmove = Some(entry.get_refutation());
     }
 
+    let mut picker = PVSPicker::new(pos, ttmove, pos.state.half_move as usize);
+
+    let (mut m, mut node) = picker.next(state);
+    let mut counter = 0;
     let mut besteval = alpha;
-    let mut bestmove= pvmove;
+    let mut bestmove = m;
 
-    let node = &mut pos.make_move(pvmove);
-    let eval = -pvs_internal(node, state, -beta, -besteval, depth_left-1, receiver);
+    // search first move with full window
+    if m.is_some() {
+        counter += 1;
 
-    if eval == -TERMINATE {
-        return TERMINATE;
-    }
-
-    if eval >= beta {
-        let rk = state.root_key;
-        let ra = state.root_age;
-        state.hash_table.place(rk, ra, pos.state.key, beta, 2, depth_left, pvmove.to_u32());
-
-        return beta;
-    }
-
-    if eval > besteval {
-        besteval = eval;
-    }
-
-    while ptr < end {
-        let m = state.move_table[ptr];
-        let node = &mut pos.make_move(m);
-
-        let mut eval = -pvs_internal(node, state, -besteval-1, -besteval, depth_left-1, receiver);
-        if eval > besteval {
-            eval = -pvs_internal(node, state, -beta, -besteval, depth_left-1, receiver);
-        }
+        let eval = -pvs_internal(&mut node.unwrap(), state, -beta, -alpha, depth_left-1, receiver);
 
         if eval == -TERMINATE {
             return TERMINATE;
@@ -150,39 +125,77 @@ pub fn pvs_internal(pos: &mut Position, state: &mut MutexGuard<SearchState>,
         if eval >= beta {
             let rk = state.root_key;
             let ra = state.root_age;
-            state.hash_table.place(rk, ra, pos.state.key, beta, 2, depth_left, m.to_u32());
+            let key = pos.state.key;
+            state.hash_table.place(rk, ra, key, beta, 2, depth_left, m.unwrap().to_u32());
             state.stats.beta_cutoffs += 1;
+
             return beta;
         }
 
         if eval > besteval {
-            bestmove = m;
             besteval = eval;
+            bestmove = m;
         }
-
-        ptr += 1;
     }
 
-    let rk = state.root_key;
-    let ra = state.root_age;
-    state.hash_table.place(rk, ra, pos.state.key,
-                           beta, (besteval != alpha) as u8, depth_left, bestmove.to_u32());
-    besteval
-}
+    // search other moves
+    (m, node) = picker.next(state);
 
-pub fn quiesce(pos: &mut Position, state: &mut MutexGuard<SearchState>, alpha: i16, beta: i16) -> i16 {
-    state.stats.qs_nodes += 1;
+    while m.is_some() {
+        counter += 1;
 
-    let slice = &mut state.move_table[pos.state.move_ptr..pos.state.move_ptr + MAX_MOVE_COUNT];
-    pos.generate(slice);
+        let mut eval = -pvs_internal(&mut node.unwrap(), state, -besteval-1, -besteval, depth_left-1, receiver);
+        if eval > besteval && eval != -TERMINATE && beta != alpha+1{
+            eval = -pvs_internal(&mut node.unwrap(), state, -beta, -besteval, depth_left-1, receiver);
+        }
 
-    if pos.state.move_cnt == 0 {
+        if eval == -TERMINATE {
+            return TERMINATE;
+        }
+
+        if eval >= beta {
+            let mu = m.unwrap();
+            if picker.stage == Quiet {
+                add_killer(pos.state.half_move, state, mu);
+            }
+
+            let rk = state.root_key;
+            let ra = state.root_age;
+            let key = pos.state.key;
+            state.hash_table.place(rk, ra, key, beta, 2, depth_left, mu.to_u32());
+            state.stats.beta_cutoffs += 1;
+
+            return beta;
+        }
+
+        if eval > besteval {
+            besteval = eval;
+            bestmove = m;
+        }
+
+        (m, node) = picker.next(state);
+    }
+
+
+    if counter == 0 {
         return if pos.is_attacked(pos.player & pos.kings) {
             LOSS
         } else {
             DRAW
         }
     }
+
+    let rk = state.root_key;
+    let ra = state.root_age;
+    let key = pos.state.key;
+    let outcome = (besteval != alpha) as u8;
+    state.hash_table.place(rk, ra, key, beta, outcome, depth_left, bestmove.unwrap().to_u32());
+
+    besteval
+}
+
+pub fn quiesce(pos: &mut Position, state: &mut MutexGuard<SearchState>, alpha: i16, beta: i16) -> i16 {
+    state.stats.qs_nodes += 1;
 
     let standing = eval(pos);
     if standing >= beta {
@@ -194,29 +207,39 @@ pub fn quiesce(pos: &mut Position, state: &mut MutexGuard<SearchState>, alpha: i
         besteval = standing;
     }
 
-
+    let slice = &mut state.move_table[pos.state.move_ptr..pos.state.move_ptr + MAX_MOVE_COUNT];
+    if pos.is_attacked(pos.kings & pos.player) {
+        pos.generate(slice);
+        if pos.state.move_cnt == 0 {
+            return  if pos.is_attacked(pos.player & pos.kings) {
+                LOSS
+            } else {
+                DRAW
+            }
+        }
+    } else {
+        pos.generate_tactical(slice);
+    }
 
     let mut ptr = pos.state.move_ptr;
     let end = pos.state.move_ptr + pos.state.move_cnt;
 
-
     while ptr < end {
         let m = state.move_table[ptr];
 
-        if m.target & pos.all != 0 {
-            let node = &mut pos.make_move(m);
-            let eval = -quiesce(node, state, -beta, -besteval);
+        let node = &mut pos.make_move(m);
+        let eval = -quiesce(node, state, -beta, -besteval);
 
-            if eval >= beta {
-                return beta;
-            }
+        if eval >= beta {
+            return beta;
+        }
 
-            if eval > besteval {
-                besteval = eval;
-            }
+        if eval > besteval {
+            besteval = eval;
         }
         ptr += 1;
     }
+
     return besteval;
 }
 

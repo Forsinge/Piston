@@ -22,10 +22,9 @@ pub const WHITE_LONG_CASTLE_BITS: u64 = 0x8800000000000000;
 pub const BLACK_SHORT_CASTLE_BITS: u64 = 0x09;
 pub const BLACK_LONG_CASTLE_BITS: u64 = 0x88;
 
-
 pub const FILE_CHARS: [char; 8] = ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
 
-#[derive(Default, Copy, Clone)]
+#[derive(Default, Copy, Clone, PartialEq)]
 pub struct Move {
     pub origin: u64,
     pub target: u64,
@@ -59,13 +58,17 @@ impl Move {
 #[derive(Default, Copy, Clone)]
 pub struct PositionState {
     pub key: u64,
-    pub material_balance: i16,
     pub en_passant: u64,
     pub castle_flags: u8,
     pub move_ptr: usize,
     pub move_cnt: usize,
     pub half_move: u8,
     pub turn: bool,
+    pub evasion_mask: u64,
+    pub pinned_mask: u64,
+    pub attack_mask: u64,
+    pub check: bool,
+    pub double_check: bool,
     pub last_move: Move,
 }
 
@@ -73,14 +76,34 @@ impl PositionState {
     pub fn next(&self, m: Move) -> PositionState {
         PositionState {
             key: self.key ^ HASH_TURN,
-            material_balance: -self.material_balance,
             en_passant: 0,
             castle_flags: self.castle_flags,
             move_ptr: (self.move_ptr + MAX_MOVE_COUNT) & (MOVE_TABLE_SIZE - 1),
             move_cnt: 0,
             half_move: self.half_move + 1,
             turn: !self.turn,
+            evasion_mask: 0,
+            pinned_mask: 0,
+            attack_mask: 0,
+            check: false,
+            double_check: false,
             last_move: m,
+        }
+    }
+}
+
+// all metrics are set w.r.t. side-to-move
+#[derive(Default, Copy, Clone)]
+pub struct EvaluationMetrics {
+    pub material_balance: i16,
+    pub advancement: i16,
+}
+
+impl EvaluationMetrics {
+    pub fn next(&self) -> EvaluationMetrics {
+        EvaluationMetrics {
+            material_balance: -self.material_balance,
+            advancement: -self.advancement,
         }
     }
 }
@@ -97,6 +120,7 @@ pub struct Position {
     pub player: u64,
     pub enemy: u64,
     pub state: PositionState,
+    pub metrics: EvaluationMetrics,
 }
 
 impl Position {
@@ -112,6 +136,7 @@ impl Position {
             player: self.player,
             enemy: self.enemy,
             state: self.state.next(m),
+            metrics: self.metrics.next(),
         }
     }
 
@@ -145,10 +170,12 @@ impl Position {
                 pos.all |= bit;
 
                 if c.is_uppercase() {
-                    pos.state.material_balance += PIECE_VALUES[tier];
+                    pos.metrics.advancement += (index!(bit) >> 3) as i16;
+                    pos.metrics.material_balance += PIECE_VALUES[tier];
                     pos.player |= bit;
                 } else {
-                    pos.state.material_balance -= PIECE_VALUES[tier];
+                    pos.metrics.advancement += ((63-index!(bit)) >> 3) as i16;
+                    pos.metrics.material_balance -= PIECE_VALUES[tier];
                 }
 
                 pointer >>= 1;
@@ -165,7 +192,7 @@ impl Position {
         }
 
         else {
-            pos.state.material_balance = -pos.state.material_balance;
+            pos.metrics = pos.metrics.next();
             pos.enemy = pos.player;
             pos.player ^= pos.all;
         }
@@ -186,6 +213,7 @@ impl Position {
         }
 
         pos.state.key = zobrist_key(&pos);
+        pos.set_masks();
         pos
     }
 
@@ -199,6 +227,23 @@ impl Position {
         self.state.move_cnt += 1;
     }
 
+    // assumes the move is quiet
+    pub fn killer_is_legal(&self, m: Move) -> bool {
+        let piece_bool = self.player & m.origin != 0;
+        let space_bool = self.all & m.target == 0;
+        let pinned_bool = self.state.pinned_mask & m.origin == 0;
+        let check_bool = !self.state.check || m.target & self.state.evasion_mask != 0;
+        let dcheck_bool = !self.state.double_check || m.tier == 5;
+
+        if piece_bool && space_bool && pinned_bool && check_bool && dcheck_bool && m.code == 0 {
+            let sq_tier = self.square_tier(m.origin);
+            let pseudo_mask = self.origin_pseudo(m);
+            return m.tier() == sq_tier && m.target & pseudo_mask != 0;
+        }
+
+        return false;
+    }
+
     pub fn square_tier(&self, square: u64) -> usize {
         if square & self.pawns != 0 { return 0 }
         if square & self.knights != 0 { return 1 }
@@ -207,6 +252,27 @@ impl Position {
         if square & self.queens != 0 { return 4 }
         if square & self.kings != 0 { return 5 }
         6
+    }
+
+    // used for killer moves, not completely correct
+    pub fn origin_pseudo(&self, m: Move) -> u64 {
+        match m.tier {
+            0 => pseudo_push(m.origin, self.all, self.player_shift_offset()),
+            1 => pseudo_knight(index!(NonZeroU64::new(m.origin).unwrap())),
+            2 => pseudo_bishop(m.origin, self.all, index!(NonZeroU64::new(m.origin).unwrap())),
+            3 => pseudo_rook(m.origin, self.all, index!(NonZeroU64::new(m.origin).unwrap())),
+            4 => pseudo_queen(m.origin, self.all, index!(NonZeroU64::new(m.origin).unwrap())),
+            5 => pseudo_king(index!(NonZeroU64::new(m.origin).unwrap())) & !self.state.attack_mask,
+            _ => 0,
+        }
+    }
+
+    pub fn player_shift_offset(&self) -> u8 {
+        return (self.state.turn as u8) << 4;
+    }
+
+    pub fn enemy_shift_offset(&self) -> u8 {
+        return (!self.state.turn as u8) << 4;
     }
 
     pub fn is_attacked(&self, square: u64) -> bool {
@@ -293,7 +359,10 @@ impl Position {
         pinned
     }
 
-    pub fn get_evasion_mask(&self, king: u64, king_index: usize) -> u64 {
+    pub fn get_evasion_mask(&mut self, king: u64, king_index: usize,) -> u64 {
+        if !self.state.check {
+            return !0u64;
+        }
 
         let attacking_pawns = LUT_PAWN_CAPTURES[!self.state.turn as usize][king_index] & self.enemy & self.pawns;
 
@@ -322,52 +391,535 @@ impl Position {
                 attackers_mask
             }
         } else {
+
             0
         }
     }
 
-    pub fn generate(&mut self, move_slice: &mut[Move]) {
+    pub fn set_masks(&mut self) {
+        let king = self.kings & self.player;
+        let king_index = index!(NonZeroU64::new(king).unwrap());
+        self.state.attack_mask = self.get_attack_bitboard(self.enemy, self.enemy_shift_offset());
+        self.state.check = self.state.attack_mask & king != 0;
+        self.state.pinned_mask = self.get_pinned_bitboard(king, king_index);
+        self.state.evasion_mask = self.get_evasion_mask(king, king_index);
+        self.state.double_check = self.state.evasion_mask == 0;
+
+    }
+
+    pub fn generate_tactical(&mut self, move_slice: &mut[Move]) {
         let king = self.player & self.kings;
         let king_index = index!(NonZeroU64::new(king).unwrap());
-        let shift_offset = (self.state.turn as u8) << 4;
 
-        let enemy_attacks = self.get_attack_bitboard(self.enemy, shift_offset ^ 16);
-
-        let evasion_mask;
         let space = !self.player;
 
-        let mut king_moves = pseudo_king(king_index) & space & !enemy_attacks;
+        let mut king_moves = pseudo_king(king_index) & space & !self.state.attack_mask & self.enemy;
         while king_moves != 0 {
             self.push_move(move_slice, king, king_moves & (!king_moves + 1), 5);
             king_moves &= king_moves - 1;
         }
 
-        if enemy_attacks & king != 0 {
-            evasion_mask = self.get_evasion_mask(king, king_index);
-        } else {
-            evasion_mask = !0u64;
+        let evasion_mask = self.state.evasion_mask;
+        if evasion_mask != 0 {
+            let pinned = self.state.pinned_mask;
+            let move_mask = self.state.evasion_mask & space;
+            let free = self.player & !pinned;
 
+            let pawns = free & self.pawns;
+            let mut knights = free & self.knights;
+            let mut bishops = free & self.bishops;
+            let mut rooks = free & self.rooks;
+            let mut queens = free & self.queens;
+
+            if self.state.turn {
+                let mut single_push = ((pawns | (self.pawns & pinned & FILES[king_index & 7])) >> 8) & !self.all;
+                let mut left_captures = ((pawns | (self.pawns & pinned & ANTIDIAGS[king_index])) >> 7) & !FILES[7] & evasion_mask & self.enemy;
+                let mut right_captures = ((pawns | (self.pawns & pinned & DIAGONALS[king_index])) >> 9) & !FILES[0] & evasion_mask & self.enemy;
+                single_push &= evasion_mask;
+
+                if pawns & RANKS[6] != 0 {
+                    let rank8 = RANKS[7];
+                    let mut single_promo = single_push & rank8;
+                    let mut left_capture_promo = left_captures & rank8;
+                    let mut right_capture_promo = right_captures & rank8;
+
+                    left_captures &= !rank8;
+                    right_captures &= !rank8;
+
+                    while single_promo != 0 {
+                        let target = single_promo & (!single_promo + 1);
+                        let origin = target << 8;
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
+                        single_promo &= single_promo - 1;
+                    }
+
+                    while left_capture_promo != 0 {
+                        let target = left_capture_promo & (!left_capture_promo + 1);
+                        let origin = target << 7;
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
+                        left_capture_promo &= left_capture_promo - 1;
+                    }
+
+                    while right_capture_promo != 0 {
+                        let target = right_capture_promo & (!right_capture_promo + 1);
+                        let origin = target << 9;
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
+                        right_capture_promo &= right_capture_promo - 1;
+                    }
+                }
+
+                let ps = self.state.en_passant;
+                if ps & evasion_mask != 0 {
+                    let left_capturer = (ps << 1) & !FILES[7] & self.pawns & self.player;
+                    let right_capturer = (ps >> 1) & !FILES[0] & self.pawns & self.player;
+
+                    if left_capturer != 0 && (left_capturer & pinned == 0 || left_capturer & DIAGONALS[king_index] != 0) {
+                        let target = ps >> 8;
+                        let en_passant_mask = left_capturer | ps | target;
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(move_slice, left_capturer, target, 0, 8);
+                        }
+                    }
+
+                    if right_capturer != 0 && (right_capturer & pinned == 0 || right_capturer & ANTIDIAGS[king_index] != 0) {
+                        let target = ps >> 8;
+                        let en_passant_mask = right_capturer | ps | target;
+
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(move_slice, right_capturer, target, 0, 8);
+                        }
+                    }
+                }
+
+                while left_captures != 0 {
+                    let target = left_captures & (!left_captures + 1);
+                    let origin = target << 7;
+                    self.push_move(move_slice, origin, target, 0);
+                    left_captures &= left_captures - 1;
+                }
+
+                while right_captures != 0 {
+                    let target = right_captures & (!right_captures + 1);
+                    let origin = target << 9;
+                    self.push_move(move_slice, origin, target, 0);
+                    right_captures &= right_captures - 1;
+                }
+            }
+
+            else {
+                let mut single_push = ((pawns | (self.pawns & pinned & FILES[king_index & 7])) << 8) & !self.all;
+                let mut left_captures = ((pawns | (self.pawns & pinned & DIAGONALS[king_index])) << 9) & !FILES[7] & evasion_mask & self.enemy;
+                let mut right_captures = ((pawns | (self.pawns & pinned & ANTIDIAGS[king_index])) << 7) & !FILES[0] & evasion_mask & self.enemy;
+                single_push &= evasion_mask;
+
+                if pawns & RANKS[1] != 0 {
+                    let rank8 = RANKS[0];
+                    let mut single_promo = single_push & rank8;
+                    let mut left_capture_promo = left_captures & rank8;
+                    let mut right_capture_promo = right_captures & rank8;
+
+                    left_captures &= !rank8;
+                    right_captures &= !rank8;
+
+                    while single_promo != 0 {
+                        let target = single_promo & (!single_promo + 1);
+                        let origin = target >> 8;
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
+                        single_promo &= single_promo - 1;
+                    }
+
+                    while left_capture_promo != 0 {
+                        let target = left_capture_promo & (!left_capture_promo + 1);
+                        let origin = target >> 9;
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
+                        left_capture_promo &= left_capture_promo - 1;
+                    }
+
+                    while right_capture_promo != 0 {
+                        let target = right_capture_promo & (!right_capture_promo + 1);
+                        let origin = target >> 7;
+                        self.push_move_with_code(move_slice, origin, target, 0, 1);
+                        self.push_move_with_code(move_slice, origin, target, 0, 2);
+                        self.push_move_with_code(move_slice, origin, target, 0, 3);
+                        self.push_move_with_code(move_slice, origin, target, 0, 4);
+                        right_capture_promo &= right_capture_promo - 1;
+                    }
+                }
+
+                let ps = self.state.en_passant;
+                if ps & evasion_mask != 0 {
+                    let left_capturer = (ps << 1) & !FILES[7] & self.pawns & self.player;
+                    let right_capturer = (ps >> 1) & !FILES[0] & self.pawns & self.player;
+
+                    if left_capturer != 0 && (left_capturer & pinned == 0 || left_capturer & ANTIDIAGS[king_index] != 0) {
+                        let target = ps << 8;
+                        let en_passant_mask = left_capturer | ps | target;
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(move_slice, left_capturer, target, 0, 8);
+                        }
+                    }
+
+                    if right_capturer != 0 && (right_capturer & pinned == 0 || right_capturer & DIAGONALS[king_index] != 0) {
+                        let target = ps << 8;
+                        let en_passant_mask = right_capturer | ps | target;
+
+                        let line_sliders = self.enemy & (self.rooks | self.queens);
+                        if pseudo_rook(king, self.all ^ en_passant_mask, king_index) & line_sliders == 0 {
+                            self.push_move_with_code(move_slice, right_capturer, target, 0, 8);
+                        }
+                    }
+                }
+
+                while left_captures != 0 {
+                    let target = left_captures & (!left_captures + 1);
+                    let origin = target >> 9;
+                    self.push_move(move_slice, origin, target, 0);
+                    left_captures &= left_captures - 1;
+                }
+
+                while right_captures != 0 {
+                    let target = right_captures & (!right_captures + 1);
+                    let origin = target >> 7;
+                    self.push_move(move_slice, origin, target, 0);
+                    right_captures &= right_captures - 1;
+                }
+            }
+
+            while knights != 0 {
+                let origin = knights & (!knights + 1);
+                let index = NonZeroU64::new(origin).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_knight(index) & move_mask & self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, origin, moves & (!moves + 1), 1);
+                    moves &= moves - 1;
+                }
+                knights &= knights - 1;
+            }
+
+            while bishops != 0 {
+                let piece = bishops & (!bishops + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_bishop(piece, self.all, origin_index) & move_mask & self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 2);
+                    moves &= moves - 1;
+                }
+                bishops &= bishops - 1;
+            }
+
+            while rooks != 0 {
+                let piece = rooks & (!rooks + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_rook(piece, self.all, origin_index) & move_mask & self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 3);
+                    moves &= moves - 1;
+                }
+                rooks &= rooks - 1;
+            }
+
+
+            while queens != 0 {
+                let piece = queens & (!queens + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_queen(piece, self.all, origin_index) & move_mask & self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 4);
+                    moves &= moves - 1;
+                }
+                queens &= queens - 1;
+            }
+
+            if evasion_mask == !0u64 {
+                let line_pins = pinned & (LUT_ROOK[king_index]);
+                let mut line_sliders = self.player & self.rooks & line_pins;
+                while line_sliders != 0 {
+                    let piece = line_sliders & (!line_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index] & self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 3);
+                        moves &= moves - 1;
+                    }
+                    line_sliders &= line_sliders - 1;
+                }
+
+                let mut line_sliders = self.player & self.queens & line_pins;
+                while line_sliders != 0 {
+                    let piece = line_sliders & (!line_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index] & self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 4);
+                        moves &= moves - 1;
+                    }
+                    line_sliders &= line_sliders - 1;
+                }
+
+                let diag_pins = pinned & (LUT_BISHOP[king_index]);
+
+                let mut diag_sliders = self.player & self.bishops & diag_pins;
+                while diag_sliders != 0 {
+                    let piece = diag_sliders & (!diag_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index] & self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 2);
+                        moves &= moves - 1;
+                    }
+                    diag_sliders &= diag_sliders - 1;
+                }
+
+                let mut diag_sliders = self.player & self.queens & diag_pins;
+                while diag_sliders != 0 {
+                    let piece = diag_sliders & (!diag_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index] & self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 4);
+                        moves &= moves - 1;
+                    }
+                    diag_sliders &= diag_sliders - 1;
+                }
+            }
+        }
+    }
+
+    pub fn generate_quiet(&mut self, move_slice: &mut[Move]) {
+        let king = self.player & self.kings;
+        let king_index = index!(NonZeroU64::new(king).unwrap());
+
+        let space = !self.player;
+
+        if !self.state.check {
             let castle_bit = if self.state.turn { WHITE_SHORT_CASTLE } else { BLACK_SHORT_CASTLE };
             if self.state.castle_flags & castle_bit != 0 {
                 let king_slide = (king >> 1) | (king >> 2);
-                if king_slide & (enemy_attacks | self.all) == 0 {
+                if king_slide & (self.state.attack_mask | self.all) == 0 {
                     self.push_move_with_code(move_slice, king, king >> 2, 5, 6);
                 }
             }
             if self.state.castle_flags & (castle_bit << 1) != 0 {
                 let king_slide = (king << 1) | (king << 2);
                 let rook_slide = king_slide | (king << 3);
-                if king_slide & enemy_attacks == 0 && rook_slide & self.all == 0 {
+                if king_slide & self.state.attack_mask == 0 && rook_slide & self.all == 0 {
                     self.push_move_with_code(move_slice, king, king << 2, 5, 7);
                 }
             }
-
         }
 
+        let evasion_mask = self.state.evasion_mask;
         if evasion_mask != 0 {
 
             let move_mask = evasion_mask & space;
-            let pinned = self.get_pinned_bitboard(king, king_index);
+            let pinned = self.state.pinned_mask;
+            let free = self.player & !pinned;
+
+            let pawns = free & self.pawns;
+            let mut knights = free & self.knights;
+            let mut bishops = free & self.bishops;
+            let mut rooks = free & self.rooks;
+            let mut queens = free & self.queens;
+
+            if self.state.turn {
+                let mut single_push = ((pawns | (self.pawns & pinned & FILES[king_index & 7])) >> 8) & !self.all;
+                let mut double_push = ((single_push) >> 8) & RANKS[3] & evasion_mask & !self.all;
+                single_push &= evasion_mask;
+
+                while single_push != 0 {
+                    let target = single_push & (!single_push + 1);
+                    let origin = target << 8;
+                    self.push_move(move_slice, origin, target, 0);
+                    single_push &= single_push - 1;
+                }
+
+                while double_push != 0 {
+                    let target = double_push & (!double_push + 1);
+                    let origin = target << 16;
+                    self.push_move_with_code(move_slice, origin, target, 0, 5);
+                    double_push &= double_push - 1;
+                }
+            }
+
+            else {
+                let mut single_push = ((pawns | (self.pawns & pinned & FILES[king_index & 7])) << 8) & !self.all;
+                let mut double_push = ((single_push) << 8) & RANKS[4] & evasion_mask & !self.all;
+                single_push &= evasion_mask;
+
+                while single_push != 0 {
+                    let target = single_push & (!single_push + 1);
+                    let origin = target >> 8;
+                    self.push_move(move_slice, origin, target, 0);
+                    single_push &= single_push - 1;
+                }
+
+                while double_push != 0 {
+                    let target = double_push & (!double_push + 1);
+                    let origin = target >> 16;
+                    self.push_move_with_code(move_slice, origin, target, 0, 5);
+                    double_push &= double_push - 1;
+                }
+            }
+
+            while knights != 0 {
+                let origin = knights & (!knights + 1);
+                let index = NonZeroU64::new(origin).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_knight(index) & move_mask & !self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, origin, moves & (!moves + 1), 1);
+                    moves &= moves - 1;
+                }
+                knights &= knights - 1;
+            }
+
+            while bishops != 0 {
+                let piece = bishops & (!bishops + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_bishop(piece, self.all, origin_index) & move_mask & !self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 2);
+                    moves &= moves - 1;
+                }
+                bishops &= bishops - 1;
+            }
+
+            while rooks != 0 {
+                let piece = rooks & (!rooks + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_rook(piece, self.all, origin_index) & move_mask & !self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 3);
+                    moves &= moves - 1;
+                }
+                rooks &= rooks - 1;
+            }
+
+
+            while queens != 0 {
+                let piece = queens & (!queens + 1);
+                let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                let mut moves = pseudo_queen(piece, self.all, origin_index) & move_mask & !self.enemy;
+                while moves != 0 {
+                    self.push_move(move_slice, piece, moves & (!moves + 1), 4);
+                    moves &= moves - 1;
+                }
+                queens &= queens - 1;
+            }
+
+            if evasion_mask == !0u64 {
+                let line_pins = pinned & (LUT_ROOK[king_index]);
+                let mut line_sliders = self.player & self.rooks & line_pins;
+                while line_sliders != 0 {
+                    let piece = line_sliders & (!line_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index] & !self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 3);
+                        moves &= moves - 1;
+                    }
+                    line_sliders &= line_sliders - 1;
+                }
+
+                let mut line_sliders = self.player & self.queens & line_pins;
+                while line_sliders != 0 {
+                    let piece = line_sliders & (!line_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_rook(piece, self.all, origin_index) & space & LUT_ROOK[king_index] & !self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 4);
+                        moves &= moves - 1;
+                    }
+                    line_sliders &= line_sliders - 1;
+                }
+
+                let diag_pins = pinned & (LUT_BISHOP[king_index]);
+
+                let mut diag_sliders = self.player & self.bishops & diag_pins;
+                while diag_sliders != 0 {
+                    let piece = diag_sliders & (!diag_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index] & !self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 2);
+                        moves &= moves - 1;
+                    }
+                    diag_sliders &= diag_sliders - 1;
+                }
+
+                let mut diag_sliders = self.player & self.queens & diag_pins;
+                while diag_sliders != 0 {
+                    let piece = diag_sliders & (!diag_sliders + 1);
+                    let origin_index = NonZeroU64::new(piece).unwrap().leading_zeros() as usize;
+                    let mut moves = pseudo_bishop(piece, self.all, origin_index) & space & LUT_BISHOP[king_index] & !self.enemy;
+                    while moves != 0 {
+                        let target = moves & (!moves + 1);
+                        self.push_move(move_slice, piece, target, 4);
+                        moves &= moves - 1;
+                    }
+                    diag_sliders &= diag_sliders - 1;
+                }
+            }
+        }
+
+        let mut king_moves = pseudo_king(king_index) & space & !self.state.attack_mask & !self.enemy;
+        while king_moves != 0 {
+            self.push_move(move_slice, king, king_moves & (!king_moves + 1), 5);
+            king_moves &= king_moves - 1;
+        }
+    }
+
+    pub fn generate(&mut self, move_slice: &mut[Move]) {
+        let king = self.player & self.kings;
+        let king_index = index!(NonZeroU64::new(king).unwrap());
+
+        let space = !self.player;
+
+        if !self.state.check {
+            let castle_bit = if self.state.turn { WHITE_SHORT_CASTLE } else { BLACK_SHORT_CASTLE };
+            if self.state.castle_flags & castle_bit != 0 {
+                let king_slide = (king >> 1) | (king >> 2);
+                if king_slide & (self.state.attack_mask | self.all) == 0 {
+                    self.push_move_with_code(move_slice, king, king >> 2, 5, 6);
+                }
+            }
+            if self.state.castle_flags & (castle_bit << 1) != 0 {
+                let king_slide = (king << 1) | (king << 2);
+                let rook_slide = king_slide | (king << 3);
+                if king_slide & self.state.attack_mask == 0 && rook_slide & self.all == 0 {
+                    self.push_move_with_code(move_slice, king, king << 2, 5, 7);
+                }
+            }
+        }
+
+        let evasion_mask = self.state.evasion_mask;
+        if evasion_mask != 0 {
+            let move_mask = evasion_mask & space;
+            let pinned = self.state.pinned_mask;
             let free = self.player & !pinned;
 
             let pawns = free & self.pawns;
@@ -686,6 +1238,12 @@ impl Position {
                 }
             }
         }
+
+        let mut king_moves = pseudo_king(king_index) & space & !self.state.attack_mask;
+        while king_moves != 0 {
+            self.push_move(move_slice, king, king_moves & (!king_moves + 1), 5);
+            king_moves &= king_moves - 1;
+        }
     }
 
     pub fn make_move(&self, m: Move) -> Position {
@@ -693,6 +1251,8 @@ impl Position {
         let target = m.target;
         let origin_index = index!(NonZeroU64::new(origin).unwrap());
         let target_index = index!(NonZeroU64::new(target).unwrap());
+        let oi_i16 = origin_index as i16;
+        let ti_i16 = target_index as i16;
 
         let player_tier = self.state.turn as usize * 6;
         let tier = m.tier();
@@ -741,7 +1301,15 @@ impl Position {
 
         match m.code {
             // Normal moves
-            0 => {}
+            0 => {
+                if pos.state.turn {
+                    pos.metrics.advancement += oi_i16 >> 3;
+                    pos.metrics.advancement -= ti_i16 >> 3;
+                } else {
+                    pos.metrics.advancement += (63 - oi_i16) >> 3;
+                    pos.metrics.advancement -= (63 - ti_i16) >> 3;
+                }
+            }
 
             // Promotions
             1 => {
@@ -749,8 +1317,9 @@ impl Position {
                 pos.knights |= target;
                 pos.state.key ^= HASH_PIECES[0 + player_tier][target_index];
                 pos.state.key ^= HASH_PIECES[1 + player_tier][target_index];
-                pos.state.material_balance += PIECE_VALUES[0];
-                pos.state.material_balance -= PIECE_VALUES[1];
+                pos.metrics.material_balance += PIECE_VALUES[0];
+                pos.metrics.material_balance -= PIECE_VALUES[1];
+                pos.metrics.advancement -= 1;
             }
 
             2 => {
@@ -758,8 +1327,9 @@ impl Position {
                 pos.bishops |= target;
                 pos.state.key ^= HASH_PIECES[0 + player_tier][target_index];
                 pos.state.key ^= HASH_PIECES[2 + player_tier][target_index];
-                pos.state.material_balance += PIECE_VALUES[0];
-                pos.state.material_balance -= PIECE_VALUES[2];
+                pos.metrics.material_balance += PIECE_VALUES[0];
+                pos.metrics.material_balance -= PIECE_VALUES[2];
+                pos.metrics.advancement -= 1;
             }
 
             3 => {
@@ -767,8 +1337,9 @@ impl Position {
                 pos.rooks |= target;
                 pos.state.key ^= HASH_PIECES[0 + player_tier][target_index];
                 pos.state.key ^= HASH_PIECES[3 + player_tier][target_index];
-                pos.state.material_balance += PIECE_VALUES[0];
-                pos.state.material_balance -= PIECE_VALUES[3];
+                pos.metrics.material_balance += PIECE_VALUES[0];
+                pos.metrics.material_balance -= PIECE_VALUES[3];
+                pos.metrics.advancement -= 1;
             }
 
             4 => {
@@ -776,14 +1347,16 @@ impl Position {
                 pos.queens |= target;
                 pos.state.key ^= HASH_PIECES[0 + player_tier][target_index];
                 pos.state.key ^= HASH_PIECES[4 + player_tier][target_index];
-                pos.state.material_balance += PIECE_VALUES[0];
-                pos.state.material_balance -= PIECE_VALUES[4];
+                pos.metrics.material_balance += PIECE_VALUES[0];
+                pos.metrics.material_balance -= PIECE_VALUES[4];
+                pos.metrics.advancement -= 1;
             }
 
             // Double pushes
             5 => {
                 pos.state.en_passant = target;
                 pos.state.key ^= HASH_ENPASSANT[target_index & 7];
+                pos.metrics.advancement -= 2;
             }
 
             // Short castle
@@ -812,7 +1385,8 @@ impl Position {
                 pos.enemy ^= self.state.en_passant;
                 pos.rooks ^= self.state.en_passant;
                 pos.state.key ^= HASH_PIECES[0 + (player_tier ^ 6)][index!(NonZeroU64::new(self.state.en_passant).unwrap())];
-                pos.state.material_balance -= PIECE_VALUES[0];
+                pos.metrics.material_balance -= PIECE_VALUES[0];
+                pos.metrics.advancement -= 4;
             }
 
             _ => {}
@@ -821,7 +1395,12 @@ impl Position {
         if self.all & target != 0 {
             let captured_tier = self.square_tier(target);
             pos.state.key ^= HASH_PIECES[captured_tier + (player_tier ^ 6)][target_index];
-            pos.state.material_balance -= PIECE_VALUES[captured_tier];
+            pos.metrics.material_balance -= PIECE_VALUES[captured_tier];
+            if pos.state.turn {
+                pos.metrics.advancement -= (63 - ti_i16) >> 3;
+            } else {
+                pos.metrics.advancement -= ti_i16 >> 3;
+            }
         }
 
         if self.state.castle_flags & WHITE_SHORT_CASTLE != 0 && move_mask & WHITE_SHORT_CASTLE_BITS != 0 {
@@ -850,7 +1429,7 @@ impl Position {
 
         pos.enemy = pos.player;
         pos.player = pos.all ^ pos.enemy;
-
+        pos.set_masks();
         pos
     }
 
