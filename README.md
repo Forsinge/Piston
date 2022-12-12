@@ -36,7 +36,7 @@ go [time constraint]    start a search for the best move given the time constrai
 
 uci                     used by clients
 isready                 used by clients
-exit                    closes the client
-quit                    closes the client
+exit                    exit
+quit                    exit
 </pre>
 
