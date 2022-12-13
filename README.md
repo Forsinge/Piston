@@ -32,7 +32,7 @@ position fen [string]   set the current position to the given FEN string
 stop                    terminate an ongoing search
 go perft [depth]        search for the number of possible positions after [depth] moves
 go [time constraint]    start a search for the best move given the time constraints
-                        (currently not fully implemented)
+                        (not finished, current always searches for 4 seconds)
 
 uci                     used by clients
 isready                 used by clients
